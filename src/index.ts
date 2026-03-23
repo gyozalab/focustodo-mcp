@@ -4,8 +4,10 @@
  * 讓 AI Agent 操控「專注清單」的任務和番茄鐘
  */
 import "dotenv/config";
+import { createServer } from "http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { FocusToDoAPI } from "./api.js";
 
@@ -393,9 +395,30 @@ server.tool(
 
 // ===== 啟動 =====
 
-async function main() {
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : null;
+
+if (PORT) {
+  // HTTP 模式（供 Zeabur 部署，Claude.ai 透過 URL 連接）
+  const httpServer = createServer(async (req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+    if (req.url === "/mcp") {
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  httpServer.listen(PORT, () => {
+    console.error(`focustodo-mcp HTTP server running on port ${PORT}`);
+  });
+} else {
+  // stdio 模式（Claude Code 本機使用）
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
-
-main().catch(console.error);
