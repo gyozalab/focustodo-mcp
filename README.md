@@ -1,57 +1,59 @@
 # Focus To-Do MCP Server
 
-MCP (Model Context Protocol) Server for [Focus To-Do (專注清單)](https://www.focustodo.cn/) — a Pomodoro timer + task management app.
+繁體中文 | [English](README.en.md)
 
-This server enables AI assistants (Claude Code, Claude Desktop, etc.) to read and write your Focus To-Do tasks, query focus statistics, and manage your Pomodoro workflow via natural language.
+為 [Focus To-Do（專注清單）](https://www.focustodo.cn/) 打造的 MCP（Model Context Protocol）伺服器——一款番茄鐘 + 任務管理 App。
 
-> **Note:** This project uses reverse-engineered APIs from Focus To-Do. It is not affiliated with or endorsed by Focus To-Do.
+透過這個伺服器，AI 助理（Claude Code、Claude Desktop 等）可以用自然語言讀寫你的任務、查詢專注統計，以及管理你的番茄鐘工作流。
 
-## Features
+> **注意：** 本專案使用對 Focus To-Do 進行逆向工程所得的 API，與 Focus To-Do 官方無關，亦未獲其授權。
 
-| Tool | Description |
-|------|-------------|
-| `focustodo_list_projects` | List all projects and tag-based lists |
-| `focustodo_list_tasks` | List tasks with filters (project, tag, priority, status) |
-| `focustodo_search_tasks` | Search tasks by keyword |
-| `focustodo_get_task_detail` | View task details including subtasks and pomodoro history |
-| `focustodo_create_task` | Create a new task |
-| `focustodo_update_task` | Update task properties |
-| `focustodo_complete_task` | Mark a task as completed |
-| `focustodo_delete_task` | Delete a task |
-| `focustodo_create_subtask` | Add a subtask |
-| `focustodo_get_today_focus` | Get today's focus time and sessions |
-| `focustodo_get_stats` | Get focus statistics (by period and project) |
+## 功能列表
 
-## Setup
+| 工具 | 說明 |
+|------|------|
+| `focustodo_list_projects` | 列出所有專案與標籤清單 |
+| `focustodo_list_tasks` | 列出任務（可依專案、標籤、優先度、狀態篩選）|
+| `focustodo_search_tasks` | 依關鍵字搜尋任務 |
+| `focustodo_get_task_detail` | 查看任務詳情（含子任務與番茄鐘紀錄）|
+| `focustodo_create_task` | 建立新任務 |
+| `focustodo_update_task` | 更新任務屬性 |
+| `focustodo_complete_task` | 將任務標記為完成 |
+| `focustodo_delete_task` | 刪除任務 |
+| `focustodo_create_subtask` | 新增子任務 |
+| `focustodo_get_today_focus` | 取得今日專注時間與番茄鐘次數 |
+| `focustodo_get_stats` | 查詢專注統計（可依時段與專案篩選）|
 
-### 1. Install dependencies
+## 安裝步驟
+
+### 1. 安裝依賴套件
 
 ```bash
 npm install
 ```
 
-### 2. Configure credentials
+### 2. 設定帳號憑證
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your Focus To-Do account credentials:
+編輯 `.env`，填入你的 Focus To-Do 帳號資訊：
 
 ```
 FOCUSTODO_ACCOUNT=your-email@example.com
 FOCUSTODO_PASSWORD=your-password
 ```
 
-### 3. Build
+### 3. 建置
 
 ```bash
 npm run build
 ```
 
-### 4. Configure MCP
+### 4. 設定 MCP
 
-Add to your Claude Code `.mcp.json` or Claude Desktop config:
+在 Claude Code 的 `.mcp.json` 或 Claude Desktop 設定檔中加入：
 
 ```json
 {
@@ -68,25 +70,25 @@ Add to your Claude Code `.mcp.json` or Claude Desktop config:
 }
 ```
 
-## Usage Examples
+## 使用範例
 
-Once configured, you can ask your AI assistant:
+設定完成後，你可以這樣問 AI 助理：
 
-- "列出我的 Blog 清單任務"
-- "幫我加一個任務到書寫 Output：寫 AI 工具評測文章，3 顆番茄"
-- "這週我花最多時間在哪個清單？"
-- "今天我專注了多久？"
+- 「列出我的 Blog 清單任務」
+- 「幫我加一個任務到書寫 Output：寫 AI 工具評測文章，3 顆番茄」
+- 「這週我花最多時間在哪個清單？」
+- 「今天我專注了多久？」
 
-## Technical Notes
+## 技術說明
 
-- **API Base**: `https://app.hk1.focustodo.net/`
-- **Auth**: Email + password login → cookie-based session
-- **Sync**: Full bidirectional sync via `POST /v64/sync`
-- **Data Model**:
-  - `type=1000` → Regular project/list
-  - `type=3000` → Tag-based virtual list (tasks reference these via the `tags` field using project IDs)
-- **Auto re-login**: Session expiry triggers automatic re-authentication
+- **API Base**：`https://app.hk1.focustodo.net/`
+- **驗證方式**：Email + 密碼登入 → Cookie-based Session
+- **同步機制**：透過 `POST /v64/sync` 進行雙向完整同步
+- **資料模型**：
+  - `type=1000` → 一般專案／清單
+  - `type=3000` → 標籤虛擬清單（任務透過 `tags` 欄位以專案 ID 參照）
+- **自動重新登入**：Session 過期時自動重新驗證
 
-## License
+## 授權
 
 MIT
