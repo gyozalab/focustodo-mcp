@@ -11,10 +11,28 @@ import type {
   Task,
   Subtask,
   Pomodoro,
+  EnrichedTask,
 } from "./types.js";
 
 const BASE_URL = "https://app.hk1.focustodo.net";
 const CLIENT_NAME = "focustodo-mcp";
+const FETCH_TIMEOUT_MS = 30_000;
+const MAX_SYNC_RETRIES = 3;
+
+/** fetch with AbortController timeout */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = FETCH_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export class FocusToDoAPI {
   private creds: Credentials | null = null;
@@ -40,7 +58,7 @@ export class FocusToDoAPI {
       client: CLIENT_NAME,
     });
 
-    const res = await fetch(`${BASE_URL}/v63/user/login`, {
+    const res = await fetchWithTimeout(`${BASE_URL}/v63/user/login`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -74,11 +92,14 @@ export class FocusToDoAPI {
   }
 
   /** 完整同步（拉取+推送）*/
-  async sync(payload?: {
-    projects?: Partial<Project>[];
-    tasks?: Partial<Task>[];
-    subtasks?: Partial<Subtask>[];
-  }): Promise<SyncResponse> {
+  async sync(
+    payload?: {
+      projects?: Partial<Project>[];
+      tasks?: Partial<Task>[];
+      subtasks?: Partial<Subtask>[];
+    },
+    _retryCount = 0
+  ): Promise<SyncResponse> {
     const creds = await this.ensureAuth();
 
     const body = new URLSearchParams({
@@ -96,7 +117,7 @@ export class FocusToDoAPI {
       uid: creds.uid,
     });
 
-    const res = await fetch(`${BASE_URL}/v64/sync`, {
+    const res = await fetchWithTimeout(`${BASE_URL}/v64/sync`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -108,12 +129,14 @@ export class FocusToDoAPI {
     const data = (await res.json()) as SyncResponse;
 
     if (data.status !== 0) {
-      // Session expired — re-login and retry
-      if (data.status === -1 || data.status === -2) {
+      // Session expired — re-login and retry (with limit to prevent infinite loop)
+      if ((data.status === -1 || data.status === -2) && _retryCount < MAX_SYNC_RETRIES) {
         this.creds = null;
-        return this.sync(payload);
+        const backoffMs = Math.min(1000 * 2 ** _retryCount, 8000) + Math.random() * 500;
+        await new Promise((r) => setTimeout(r, backoffMs));
+        return this.sync(payload, _retryCount + 1);
       }
-      throw new Error(`Sync failed: status=${data.status}`);
+      throw new Error(`Sync failed: status=${data.status} (after ${_retryCount} retries)`);
     }
 
     // Update session cookie if returned
@@ -178,7 +201,7 @@ export class FocusToDoAPI {
     priority?: number;
     isFinished?: boolean;
     includeDeleted?: boolean;
-  }): Promise<(Task & { projectName?: string })[]> {
+  }): Promise<EnrichedTask[]> {
     await this.ensureData();
 
     let tasks = this._tasks.filter((t) => !filters?.includeDeleted ? !t.isDeleted : true);
@@ -313,12 +336,21 @@ export class FocusToDoAPI {
     };
 
     await this.sync({ tasks: [task] });
+
+    // Ensure task is in local cache (server may not echo it back)
+    const idx = this._tasks.findIndex((t) => t.id === task.id);
+    if (idx >= 0) {
+      this._tasks[idx] = task;
+    } else {
+      this._tasks.push(task);
+    }
+
     return task;
   }
 
   async updateTask(
     taskId: string,
-    updates: Partial<Pick<Task, "name" | "tags" | "priority" | "estimatePomoNum" | "deadline" | "remark" | "projectId" | "isFinished" | "finishedDate">>
+    updates: Partial<Pick<Task, "name" | "tags" | "priority" | "estimatePomoNum" | "deadline" | "remark" | "projectId" | "isFinished" | "finishedDate" | "isDeleted">>
   ): Promise<Task | null> {
     await this.ensureData();
 
@@ -326,7 +358,20 @@ export class FocusToDoAPI {
     if (!task) return null;
 
     const updated = { ...task, ...updates };
+    const pushedAt = Date.now();
+
     await this.sync({ tasks: [updated] });
+
+    // Update local cache (best effort — verifyServerApplied may throw if server rejected)
+    const idx = this._tasks.findIndex((t) => t.id === taskId);
+    if (idx >= 0) {
+      this._tasks[idx] = updated;
+    }
+
+    // ⚠️ Server 對既有任務的修改有 anti-tampering 鎖，可能 silently reject
+    // (status=0 但不持久化)。必須 post-write verify，否則會回假成功。
+    await this.verifyServerApplied(taskId, updates, pushedAt);
+
     return updated;
   }
 
@@ -338,9 +383,78 @@ export class FocusToDoAPI {
   }
 
   async deleteTask(taskId: string): Promise<Task | null> {
-    return this.updateTask(taskId, {
-      isDeleted: true,
-    } as any);
+    return this.updateTask(taskId, { isDeleted: true });
+  }
+
+  /**
+   * Post-write verification: 確認 server 真的接受了我們的更新。
+   *
+   * Why: FocusTodo server 對「修改既有任務」有 anti-tampering 機制，
+   * 會回 status=0 但不持久化變更。沒有 verify 就無法區分真假成功。
+   *
+   * 做法：等 1.5 秒讓 server 處理，再用獨立 clientId 跑 delta sync
+   * 抓 push 之前 5 秒到現在的所有變動，比對指定 taskId 是否在 delta 中
+   * 且欄位狀態符合 expected。
+   */
+  private async verifyServerApplied(
+    taskId: string,
+    expectedFields: Record<string, unknown>,
+    pushedAt: number
+  ): Promise<void> {
+    const creds = await this.ensureAuth();
+
+    // Wait for server processing
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const body = new URLSearchParams({
+      timestamp: String(pushedAt - 5000),
+      clientId: randomUUID(), // 用新 clientId 避免 server 過濾同 client 的變動
+      client: CLIENT_NAME,
+      projects: "[]",
+      tasks: "[]",
+      subtasks: "[]",
+      pomodoros: "[]",
+      schedules: "[]",
+      acct: creds.acct,
+      name: creds.name,
+      pid: creds.pid,
+      uid: creds.uid,
+    });
+
+    const res = await fetchWithTimeout(`${BASE_URL}/v64/sync`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        Cookie: creds.cookies,
+      },
+      body: body.toString(),
+    });
+
+    const data = (await res.json()) as SyncResponse;
+    const echoed = data.tasks?.find((t) => t.id === taskId);
+
+    if (!echoed) {
+      throw new Error(
+        `Server 沒收到此 update（taskId=${taskId.slice(0, 8)}...）。可能原因：` +
+        `(1) FocusTodo 對既有任務有 anti-tampering 鎖，需要從 App 操作；` +
+        `(2) 網路問題。本地快取與 server 已不一致，請在 App 內手動執行此操作。`
+      );
+    }
+
+    const mismatches: string[] = [];
+    for (const [key, expected] of Object.entries(expectedFields)) {
+      const actual = (echoed as unknown as Record<string, unknown>)[key];
+      if (actual !== expected) {
+        mismatches.push(`${key}: 期望=${JSON.stringify(expected)} 實際=${JSON.stringify(actual)}`);
+      }
+    }
+
+    if (mismatches.length > 0) {
+      throw new Error(
+        `Server 收到變動但欄位不符（taskId=${taskId.slice(0, 8)}...）：${mismatches.join("; ")}。` +
+        `本地快取與 server 已不一致，請在 App 內手動處理。`
+      );
+    }
   }
 
   async createSubtask(params: {
@@ -365,6 +479,15 @@ export class FocusToDoAPI {
     };
 
     await this.sync({ subtasks: [subtask] });
+
+    // Ensure subtask is in local cache
+    const subIdx = this._subtasks.findIndex((s) => s.id === subtask.id);
+    if (subIdx >= 0) {
+      this._subtasks[subIdx] = subtask;
+    } else {
+      this._subtasks.push(subtask);
+    }
+
     return subtask;
   }
 

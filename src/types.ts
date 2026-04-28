@@ -105,3 +105,9 @@ export interface Credentials {
   pid: string;
   uid: string;
 }
+
+/** Task enriched with resolved project name and tag names (returned by getTasks) */
+export type EnrichedTask = Task & {
+  projectName?: string;
+  tagNames?: string;
+};

@@ -10,6 +10,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { FocusToDoAPI } from "./api.js";
+import type { EnrichedTask } from "./types.js";
 
 const account = process.env.FOCUSTODO_ACCOUNT;
 const password = process.env.FOCUSTODO_PASSWORD;
@@ -23,7 +24,7 @@ const api = new FocusToDoAPI(account, password);
 
 const server = new McpServer({
   name: "focustodo",
-  version: "1.0.0",
+  version: "1.2.0",
 });
 
 // ===== Helper =====
@@ -52,6 +53,12 @@ const priorityLabels: Record<number, string> = {
   3: "高",
 };
 
+/** Wrap a tool handler with try/catch to return structured errors */
+function errorText(error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error);
+  return `❌ FocusTodo 錯誤：${msg}`;
+}
+
 // ===== Tools =====
 
 server.tool(
@@ -59,14 +66,18 @@ server.tool(
   "列出所有清單（如：工作 Work、書寫 Output、Blog 等）",
   {},
   async () => {
-    const projects = await api.getProjects();
-    const lines = projects
-      .sort((a, b) => a.order - b.order)
-      .map((p) => {
-        const typeLabel = p.type === 3000 ? "標籤" : "清單";
-        return `- [${typeLabel}] ${p.name} (id: ${p.id})`;
-      });
-    return { content: [{ type: "text", text: `找到 ${projects.length} 個清單：\n${lines.join("\n")}` }] };
+    try {
+      const projects = await api.getProjects();
+      const lines = projects
+        .sort((a, b) => a.order - b.order)
+        .map((p) => {
+          const typeLabel = p.type === 3000 ? "標籤" : "清單";
+          return `- [${typeLabel}] ${p.name} (id: ${p.id})`;
+        });
+      return { content: [{ type: "text", text: `找到 ${projects.length} 個清單：\n${lines.join("\n")}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 
@@ -81,36 +92,40 @@ server.tool(
     limit: z.number().optional().default(20).describe("最多顯示幾筆（預設 20）"),
   },
   async (params) => {
-    const tasks = await api.getTasks({
-      projectName: params.projectName,
-      tag: params.tag,
-      priority: params.priority,
-      isFinished: params.isFinished,
-    });
+    try {
+      const tasks = await api.getTasks({
+        projectName: params.projectName,
+        tag: params.tag,
+        priority: params.priority,
+        isFinished: params.isFinished,
+      });
 
-    const sorted = tasks.sort((a, b) => {
-      if (a.priority !== b.priority) return b.priority - a.priority;
-      return b.creationDate - a.creationDate;
-    });
+      const sorted = tasks.sort((a, b) => {
+        if (a.priority !== b.priority) return b.priority - a.priority;
+        return b.creationDate - a.creationDate;
+      });
 
-    const limited = sorted.slice(0, params.limit);
+      const limited = sorted.slice(0, params.limit);
 
-    const lines = limited.map((t) => {
-      const status = t.isFinished ? "✅" : "⬜";
-      const prio = t.priority > 0 ? ` [${priorityLabels[t.priority]}]` : "";
-      const deadline = t.deadline ? ` 📅${formatDate(t.deadline)}` : "";
-      const pomo = t.estimatePomoNum > 0 ? ` 🍅${t.actualPomoNum}/${t.estimatePomoNum}` : "";
-      const tags = (t as any).tagNames ? ` ${(t as any).tagNames}` : "";
-      const proj = t.projectName ? ` | ${t.projectName}` : "";
-      return `${status} ${t.name}${prio}${pomo}${deadline}${tags}${proj}\n   id: ${t.id}`;
-    });
+      const lines = limited.map((t: EnrichedTask) => {
+        const status = t.isFinished ? "✅" : "⬜";
+        const prio = t.priority > 0 ? ` [${priorityLabels[t.priority]}]` : "";
+        const deadline = t.deadline ? ` 📅${formatDate(t.deadline)}` : "";
+        const pomo = t.estimatePomoNum > 0 ? ` 🍅${t.actualPomoNum}/${t.estimatePomoNum}` : "";
+        const tags = t.tagNames ? ` ${t.tagNames}` : "";
+        const proj = t.projectName ? ` | ${t.projectName}` : "";
+        return `${status} ${t.name}${prio}${pomo}${deadline}${tags}${proj}\n   id: ${t.id}`;
+      });
 
-    return {
-      content: [{
-        type: "text",
-        text: `找到 ${tasks.length} 個任務（顯示前 ${limited.length} 個）：\n\n${lines.join("\n\n")}`,
-      }],
-    };
+      return {
+        content: [{
+          type: "text",
+          text: `找到 ${tasks.length} 個任務（顯示前 ${limited.length} 個）：\n\n${lines.join("\n\n")}`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 
@@ -121,47 +136,51 @@ server.tool(
     taskId: z.string().describe("任務 ID"),
   },
   async ({ taskId }) => {
-    const tasks = await api.getTasks({ includeDeleted: false });
-    const task = tasks.find((t) => t.id === taskId);
-    if (!task) {
-      return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
-    }
-
-    const subtasks = await api.getSubtasks(taskId);
-    const pomodoros = await api.getPomodoros({ taskId });
-
-    const totalFocus = pomodoros.reduce((sum, p) => sum + p.interval, 0);
-
-    let text = `📋 ${task.name}\n`;
-    text += `狀態: ${task.isFinished ? "已完成" : "進行中"}\n`;
-    text += `清單: ${task.projectName || "未分類"}\n`;
-    text += `優先級: ${priorityLabels[task.priority]}\n`;
-    text += `番茄: ${task.actualPomoNum}/${task.estimatePomoNum} (每個 ${task.pomodoroInterval / 60} 分鐘)\n`;
-    text += `已專注: ${formatSeconds(totalFocus)}\n`;
-    text += `到期日: ${formatDate(task.deadline)}\n`;
-    text += `標籤: ${task.tags || "無"}\n`;
-    text += `建立日期: ${formatDate(task.creationDate)}\n`;
-
-    if (task.remark) {
-      text += `\n備註:\n${task.remark}\n`;
-    }
-
-    if (subtasks.length > 0) {
-      text += `\n子任務 (${subtasks.length}):\n`;
-      for (const s of subtasks.sort((a, b) => a.order - b.order)) {
-        text += `  ${s.isFinished ? "✅" : "⬜"} ${s.name}\n`;
+    try {
+      const tasks = await api.getTasks({ includeDeleted: false });
+      const task = tasks.find((t) => t.id === taskId);
+      if (!task) {
+        return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
       }
-    }
 
-    if (pomodoros.length > 0) {
-      text += `\n最近 5 個番茄鐘:\n`;
-      const recent = pomodoros.sort((a, b) => b.endDate - a.endDate).slice(0, 5);
-      for (const p of recent) {
-        text += `  🍅 ${formatDate(p.endDate)} - ${formatSeconds(p.interval)}\n`;
+      const subtasks = await api.getSubtasks(taskId);
+      const pomodoros = await api.getPomodoros({ taskId });
+
+      const totalFocus = pomodoros.reduce((sum, p) => sum + p.interval, 0);
+
+      let text = `📋 ${task.name}\n`;
+      text += `狀態: ${task.isFinished ? "已完成" : "進行中"}\n`;
+      text += `清單: ${task.projectName || "未分類"}\n`;
+      text += `優先級: ${priorityLabels[task.priority]}\n`;
+      text += `番茄: ${task.actualPomoNum}/${task.estimatePomoNum} (每個 ${task.pomodoroInterval / 60} 分鐘)\n`;
+      text += `已專注: ${formatSeconds(totalFocus)}\n`;
+      text += `到期日: ${formatDate(task.deadline)}\n`;
+      text += `標籤: ${task.tags || "無"}\n`;
+      text += `建立日期: ${formatDate(task.creationDate)}\n`;
+
+      if (task.remark) {
+        text += `\n備註:\n${task.remark}\n`;
       }
-    }
 
-    return { content: [{ type: "text", text }] };
+      if (subtasks.length > 0) {
+        text += `\n子任務 (${subtasks.length}):\n`;
+        for (const s of subtasks.sort((a, b) => a.order - b.order)) {
+          text += `  ${s.isFinished ? "✅" : "⬜"} ${s.name}\n`;
+        }
+      }
+
+      if (pomodoros.length > 0) {
+        text += `\n最近 5 個番茄鐘:\n`;
+        const recent = pomodoros.sort((a, b) => b.endDate - a.endDate).slice(0, 5);
+        for (const p of recent) {
+          text += `  🍅 ${formatDate(p.endDate)} - ${formatSeconds(p.interval)}\n`;
+        }
+      }
+
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 
@@ -178,30 +197,34 @@ server.tool(
     remark: z.string().optional().describe("備註內容"),
   },
   async (params) => {
-    const deadline = params.deadline ? new Date(params.deadline).getTime() : undefined;
+    try {
+      const deadline = params.deadline ? new Date(params.deadline).getTime() : undefined;
 
-    const task = await api.createTask({
-      name: params.name,
-      projectName: params.projectName,
-      tags: params.tags,
-      priority: params.priority,
-      estimatePomoNum: params.estimatePomoNum,
-      deadline,
-      remark: params.remark,
-    });
+      const task = await api.createTask({
+        name: params.name,
+        projectName: params.projectName,
+        tags: params.tags,
+        priority: params.priority,
+        estimatePomoNum: params.estimatePomoNum,
+        deadline,
+        remark: params.remark,
+      });
 
-    return {
-      content: [{
-        type: "text",
-        text: `✅ 已建立任務「${task.name}」\nID: ${task.id}\n清單: ${params.projectName || "預設"}\n優先級: ${priorityLabels[params.priority ?? 0]}\n番茄數: ${params.estimatePomoNum ?? 0}`,
-      }],
-    };
+      return {
+        content: [{
+          type: "text",
+          text: `✅ 已建立任務「${task.name}」\nID: ${task.id}\n清單: ${params.projectName || "預設"}\n優先級: ${priorityLabels[params.priority ?? 0]}\n番茄數: ${params.estimatePomoNum ?? 0}`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 
 server.tool(
   "focustodo_update_task",
-  "修改任務的名稱、優先級、到期日、標籤等",
+  "修改任務的名稱、優先級、到期日、標籤等。⚠️ 重要：FocusTodo server 對修改既有任務有 anti-tampering 鎖，本工具會 post-write 驗證，server 沒接受就 throw 錯誤。回 ✅ 才代表 server 真的更新了。",
   {
     taskId: z.string().describe("任務 ID"),
     name: z.string().optional().describe("新名稱"),
@@ -212,55 +235,67 @@ server.tool(
     remark: z.string().optional().describe("新備註"),
   },
   async (params) => {
-    const updates: Record<string, unknown> = {};
-    if (params.name !== undefined) updates.name = params.name;
-    if (params.tags !== undefined) updates.tags = params.tags;
-    if (params.priority !== undefined) updates.priority = params.priority;
-    if (params.estimatePomoNum !== undefined) updates.estimatePomoNum = params.estimatePomoNum;
-    if (params.deadline !== undefined) updates.deadline = new Date(params.deadline).getTime();
-    if (params.remark !== undefined) updates.remark = params.remark;
+    try {
+      const updates: Record<string, unknown> = {};
+      if (params.name !== undefined) updates.name = params.name;
+      if (params.tags !== undefined) updates.tags = params.tags;
+      if (params.priority !== undefined) updates.priority = params.priority;
+      if (params.estimatePomoNum !== undefined) updates.estimatePomoNum = params.estimatePomoNum;
+      if (params.deadline !== undefined) updates.deadline = new Date(params.deadline).getTime();
+      if (params.remark !== undefined) updates.remark = params.remark;
 
-    const task = await api.updateTask(params.taskId, updates);
-    if (!task) {
-      return { content: [{ type: "text", text: `找不到任務 ${params.taskId}` }] };
+      const task = await api.updateTask(params.taskId, updates);
+      if (!task) {
+        return { content: [{ type: "text", text: `找不到任務 ${params.taskId}` }] };
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: `✅ 已更新任務「${task.name}」（server 已確認）\n更新欄位: ${Object.keys(updates).join(", ")}`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
     }
-
-    return {
-      content: [{
-        type: "text",
-        text: `✅ 已更新任務「${task.name}」\n更新欄位: ${Object.keys(updates).join(", ")}`,
-      }],
-    };
   }
 );
 
 server.tool(
   "focustodo_complete_task",
-  "將任務標記為已完成",
+  "將任務標記為已完成。⚠️ 同 update_task：post-write 驗證，server 沒接受就 throw。回 ✅ 才代表真完成。",
   {
     taskId: z.string().describe("任務 ID"),
   },
   async ({ taskId }) => {
-    const task = await api.completeTask(taskId);
-    if (!task) {
-      return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
+    try {
+      const task = await api.completeTask(taskId);
+      if (!task) {
+        return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
+      }
+      return { content: [{ type: "text", text: `✅ 已完成任務「${task.name}」（server 已確認）` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
     }
-    return { content: [{ type: "text", text: `✅ 已完成任務「${task.name}」` }] };
   }
 );
 
 server.tool(
   "focustodo_delete_task",
-  "刪除任務",
+  "刪除任務（軟刪除）。⚠️ FocusTodo server 對既有任務有 anti-tampering 鎖。本工具會 post-write 驗證，server 沒接受就 throw 錯誤。回 ✅ 才代表 server 真的刪了；🚫 失敗時請告知使用者用 FocusTodo App 操作。",
   {
     taskId: z.string().describe("任務 ID"),
   },
   async ({ taskId }) => {
-    const task = await api.deleteTask(taskId);
-    if (!task) {
-      return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
+    try {
+      const task = await api.deleteTask(taskId);
+      if (!task) {
+        return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
+      }
+      return { content: [{ type: "text", text: `✅ 已刪除任務「${task.name}」（server 已確認）` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
     }
-    return { content: [{ type: "text", text: `🗑️ 已刪除任務「${task.name}」` }] };
   }
 );
 
@@ -273,13 +308,17 @@ server.tool(
     estimatedPomoNum: z.number().optional().describe("預估番茄數"),
   },
   async (params) => {
-    const subtask = await api.createSubtask(params);
-    return {
-      content: [{
-        type: "text",
-        text: `✅ 已建立子任務「${subtask.name}」\nID: ${subtask.id}`,
-      }],
-    };
+    try {
+      const subtask = await api.createSubtask(params);
+      return {
+        content: [{
+          type: "text",
+          text: `✅ 已建立子任務「${subtask.name}」\nID: ${subtask.id}`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 
@@ -288,21 +327,25 @@ server.tool(
   "查詢今日的專注時間和番茄鐘記錄",
   {},
   async () => {
-    const data = await api.getTodayFocus();
-    let text = `📊 今日專注記錄\n\n`;
-    text += `總專注時間: ${formatSeconds(data.focusTime)}\n`;
-    text += `完成番茄鐘: ${data.pomodoros} 個\n\n`;
+    try {
+      const data = await api.getTodayFocus();
+      let text = `📊 今日專注記錄\n\n`;
+      text += `總專注時間: ${formatSeconds(data.focusTime)}\n`;
+      text += `完成番茄鐘: ${data.pomodoros} 個\n\n`;
 
-    if (data.tasks.length > 0) {
-      text += `任務明細:\n`;
-      for (const t of data.tasks) {
-        text += `  🍅 ${t.name} - ${formatSeconds(t.focusTime)} (${t.pomodoros} 個番茄)\n`;
+      if (data.tasks.length > 0) {
+        text += `任務明細:\n`;
+        for (const t of data.tasks) {
+          text += `  🍅 ${t.name} - ${formatSeconds(t.focusTime)} (${t.pomodoros} 個番茄)\n`;
+        }
+      } else {
+        text += `今天還沒有專注記錄。`;
       }
-    } else {
-      text += `今天還沒有專注記錄。`;
-    }
 
-    return { content: [{ type: "text", text }] };
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 
@@ -314,49 +357,53 @@ server.tool(
     projectName: z.string().optional().describe("清單名稱（如 'Blog'）"),
   },
   async (params) => {
-    let startDate: number | undefined;
-    const now = new Date();
+    try {
+      let startDate: number | undefined;
+      const now = new Date();
 
-    switch (params.period) {
-      case "today": {
-        const today = new Date(now);
-        today.setHours(0, 0, 0, 0);
-        startDate = today.getTime();
-        break;
+      switch (params.period) {
+        case "today": {
+          const today = new Date(now);
+          today.setHours(0, 0, 0, 0);
+          startDate = today.getTime();
+          break;
+        }
+        case "this_week": {
+          const weekStart = new Date(now);
+          weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+          weekStart.setHours(0, 0, 0, 0);
+          startDate = weekStart.getTime();
+          break;
+        }
+        case "this_month": {
+          const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+          startDate = monthStart.getTime();
+          break;
+        }
       }
-      case "this_week": {
-        const weekStart = new Date(now);
-        weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-        weekStart.setHours(0, 0, 0, 0);
-        startDate = weekStart.getTime();
-        break;
+
+      const stats = await api.getStats({
+        startDate,
+        projectName: params.projectName,
+      });
+
+      let text = `📊 專注統計\n\n`;
+      text += `總專注時間: ${formatSeconds(stats.totalFocusTime)}\n`;
+      text += `番茄鐘數: ${stats.totalPomodoros} 個\n`;
+      text += `已完成任務: ${stats.completedTasks} 個\n`;
+      text += `待完成任務: ${stats.pendingTasks} 個\n`;
+
+      if (stats.projectBreakdown.length > 0) {
+        text += `\n📁 清單時間分佈:\n`;
+        for (const p of stats.projectBreakdown.slice(0, 10)) {
+          text += `  ${p.name}: ${formatSeconds(p.focusTime)} (${p.pomodoros} 個番茄)\n`;
+        }
       }
-      case "this_month": {
-        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-        startDate = monthStart.getTime();
-        break;
-      }
+
+      return { content: [{ type: "text", text }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
     }
-
-    const stats = await api.getStats({
-      startDate,
-      projectName: params.projectName,
-    });
-
-    let text = `📊 專注統計\n\n`;
-    text += `總專注時間: ${formatSeconds(stats.totalFocusTime)}\n`;
-    text += `番茄鐘數: ${stats.totalPomodoros} 個\n`;
-    text += `已完成任務: ${stats.completedTasks} 個\n`;
-    text += `待完成任務: ${stats.pendingTasks} 個\n`;
-
-    if (stats.projectBreakdown.length > 0) {
-      text += `\n📁 清單時間分佈:\n`;
-      for (const p of stats.projectBreakdown.slice(0, 10)) {
-        text += `  ${p.name}: ${formatSeconds(p.focusTime)} (${p.pomodoros} 個番茄)\n`;
-      }
-    }
-
-    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -368,28 +415,32 @@ server.tool(
     limit: z.number().optional().default(10).describe("最多顯示幾筆"),
   },
   async ({ query, limit }) => {
-    const tasks = await api.getTasks();
-    const queryLC = query.toLowerCase();
-    const matched = tasks
-      .filter((t) =>
-        t.name.toLowerCase().includes(queryLC) ||
-        (t as any).tagNames?.toLowerCase().includes(queryLC) ||
-        t.remark?.toLowerCase().includes(queryLC)
-      )
-      .slice(0, limit);
+    try {
+      const tasks = await api.getTasks();
+      const queryLC = query.toLowerCase();
+      const matched = tasks
+        .filter((t: EnrichedTask) =>
+          t.name.toLowerCase().includes(queryLC) ||
+          t.tagNames?.toLowerCase().includes(queryLC) ||
+          t.remark?.toLowerCase().includes(queryLC)
+        )
+        .slice(0, limit);
 
-    const lines = matched.map((t) => {
-      const status = t.isFinished ? "✅" : "⬜";
-      const proj = t.projectName ? ` | ${t.projectName}` : "";
-      return `${status} ${t.name}${proj}\n   id: ${t.id}`;
-    });
+      const lines = matched.map((t: EnrichedTask) => {
+        const status = t.isFinished ? "✅" : "⬜";
+        const proj = t.projectName ? ` | ${t.projectName}` : "";
+        return `${status} ${t.name}${proj}\n   id: ${t.id}`;
+      });
 
-    return {
-      content: [{
-        type: "text",
-        text: `搜尋「${query}」找到 ${matched.length} 個任務：\n\n${lines.join("\n\n")}`,
-      }],
-    };
+      return {
+        content: [{
+          type: "text",
+          text: `搜尋「${query}」找到 ${matched.length} 個任務：\n\n${lines.join("\n\n")}`,
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: errorText(error) }] };
+    }
   }
 );
 

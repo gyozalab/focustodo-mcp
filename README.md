@@ -87,6 +87,21 @@ Once configured, you can ask your AI assistant:
   - `type=3000` → Tag-based virtual list (tasks reference these via the `tags` field using project IDs)
 - **Auto re-login**: Session expiry triggers automatic re-authentication
 
+## ⚠️ Known Limitations (v1.2.0)
+
+**Server-side anti-tampering for existing tasks**
+
+FocusTodo's `/v64/sync` server silently rejects modifications to existing task IDs from non-official clients (chrome extension / mobile app are the only authorized writers — they include an undisclosed signature). Confirmed via:
+- MCP `update_task` / `complete_task` / `delete_task` → server returns `status=0` but never persists
+- Direct `POST` bypassing MCP, with `client="chrome-extension"` → still rejected
+- INSERT (new task IDs) is the only write path that works
+
+**v1.2.0 mitigation**: All `update_task` / `complete_task` / `delete_task` calls now do a post-write delta sync to verify the server actually applied the change. If verification fails, the tool throws an error explaining the limitation. This eliminates the "false success" problem where Claude reports `✅ deleted` but nothing changes server-side.
+
+**Workaround for users**: When you see the verification error, perform the modification directly in the FocusTodo App (search-and-swipe-delete, or check/edit in-app).
+
+**Future work (out of scope for v1.2.0)**: Reverse-engineer the chrome-extension signature scheme via mitmproxy capture. Until then, MCP is read-and-create-only for existing tasks.
+
 ## License
 
 MIT

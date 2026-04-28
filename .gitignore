@@ -3,3 +3,4 @@ dist/
 .env
 *.log
 probe-sync-response.json
+probe-out.txt
