@@ -201,10 +201,18 @@ export class FocusToDoAPI {
     priority?: number;
     isFinished?: boolean;
     includeDeleted?: boolean;
+    /** 預設 false：隱藏 projectId="" 的「真孤兒」（user 在 App 看不到、且無法刪除）。
+     *  設 true 才會把這些殭屍卡列出來。projectId="id-task-tasks" 的 Inbox 卡不算孤兒，永遠顯示。 */
+    includeOrphans?: boolean;
   }): Promise<EnrichedTask[]> {
     await this.ensureData();
 
     let tasks = this._tasks.filter((t) => !filters?.includeDeleted ? !t.isDeleted : true);
+
+    // ⬇️ 預設過濾真孤兒（projectId=""），保留 Inbox magic 字串 "id-task-tasks"
+    if (!filters?.includeOrphans) {
+      tasks = tasks.filter((t) => t.projectId !== "");
+    }
 
     if (filters?.projectId) {
       tasks = tasks.filter((t) => t.projectId === filters.projectId);

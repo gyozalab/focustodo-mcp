@@ -87,7 +87,7 @@ Once configured, you can ask your AI assistant:
   - `type=3000` → Tag-based virtual list (tasks reference these via the `tags` field using project IDs)
 - **Auto re-login**: Session expiry triggers automatic re-authentication
 
-## ⚠️ Known Limitations (v1.2.0)
+## ⚠️ Known Limitations (v1.2.1)
 
 **Server-side anti-tampering for existing tasks**
 
@@ -100,7 +100,15 @@ FocusTodo's `/v64/sync` server silently rejects modifications to existing task I
 
 **Workaround for users**: When you see the verification error, perform the modification directly in the FocusTodo App (search-and-swipe-delete, or check/edit in-app).
 
-**Future work (out of scope for v1.2.0)**: Reverse-engineer the chrome-extension signature scheme via mitmproxy capture. Until then, MCP is read-and-create-only for existing tasks.
+**Future work (out of scope for v1.2.1)**: Reverse-engineer the chrome-extension signature scheme via mitmproxy capture. Until then, MCP is read-and-create-only for existing tasks.
+
+### Orphan tasks (projectId = empty string)
+
+Tasks created without a `projectId` (legacy MCP create_task missing `projectName`) become "true orphans" — they exist on the server but the FocusTodo App's UI does NOT surface them in any view (lists, search, inbox all skip them). Combined with the anti-tampering lock, these tasks cannot be deleted by the user.
+
+Note: `projectId = "id-task-tasks"` is the special **Inbox** project — these ARE visible in the App and not orphans.
+
+**v1.2.1 mitigation**: `list_tasks` and `search_tasks` filter out orphans by default. Pass `includeOrphans: true` to surface them (debugging only). `get_task_detail` always returns orphans when queried by exact ID. This prevents zombies from polluting daily task lists.
 
 ## License
 

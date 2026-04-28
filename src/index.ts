@@ -24,7 +24,7 @@ const api = new FocusToDoAPI(account, password);
 
 const server = new McpServer({
   name: "focustodo",
-  version: "1.2.0",
+  version: "1.2.1",
 });
 
 // ===== Helper =====
@@ -83,13 +83,14 @@ server.tool(
 
 server.tool(
   "focustodo_list_tasks",
-  "列出某個清單或標籤下的所有任務。這是查詢任務的主要工具 — 當使用者說「列出 Blog 任務」「書寫 Output 有什麼」等，請用此工具並傳入 projectName",
+  "列出某個清單或標籤下的所有任務。這是查詢任務的主要工具 — 當使用者說「列出 Blog 任務」「書寫 Output 有什麼」等，請用此工具並傳入 projectName。⚠️ 預設會過濾掉「真孤兒」殭屍卡（projectId 為空、user 在 App 看不到也刪不掉），需要除錯時用 includeOrphans=true 才看得到。",
   {
     projectName: z.string().optional().describe("清單名稱（模糊匹配，如 'Blog'、'書寫'）"),
     tag: z.string().optional().describe("標籤（如 '#Blog'、'#iPAS AI 中級'）"),
     priority: z.number().min(0).max(3).optional().describe("優先級：0=無, 1=低, 2=中, 3=高"),
     isFinished: z.boolean().optional().describe("true=已完成, false=未完成"),
     limit: z.number().optional().default(20).describe("最多顯示幾筆（預設 20）"),
+    includeOrphans: z.boolean().optional().default(false).describe("是否包含真孤兒殭屍卡（projectId=空字串、App 看不到、無法 update/delete）。預設 false 隱藏。除錯或回顧歷史殘留才開 true。"),
   },
   async (params) => {
     try {
@@ -98,6 +99,7 @@ server.tool(
         tag: params.tag,
         priority: params.priority,
         isFinished: params.isFinished,
+        includeOrphans: params.includeOrphans,
       });
 
       const sorted = tasks.sort((a, b) => {
@@ -137,7 +139,8 @@ server.tool(
   },
   async ({ taskId }) => {
     try {
-      const tasks = await api.getTasks({ includeDeleted: false });
+      // get_task_detail 透過 ID 精確查詢，包含孤兒卡讓除錯時能看到完整資料
+      const tasks = await api.getTasks({ includeDeleted: false, includeOrphans: true });
       const task = tasks.find((t) => t.id === taskId);
       if (!task) {
         return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
