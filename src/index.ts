@@ -68,6 +68,27 @@ function text(t: string) {
   return { content: [{ type: "text" as const, text: t }] };
 }
 
+/** 批次寫入的回報。部分成功要講清楚哪些過、哪些沒過。 */
+function batchReport(
+  verb: string,
+  r: { updated: { name: string }[]; failed: { id: string; reason: string }[] }
+): string {
+  const parts: string[] = [];
+  if (r.updated.length) {
+    parts.push(
+      `✅ 已${verb} ${r.updated.length} 個（server 已確認）：\n` +
+      r.updated.map((t) => "  · " + t.name).join("\n")
+    );
+  }
+  if (r.failed.length) {
+    parts.push(
+      `❌ 失敗 ${r.failed.length} 個：\n` +
+      r.failed.map((f) => `  · ${f.id.slice(0, 8)}… ${f.reason}`).join("\n")
+    );
+  }
+  return parts.join("\n\n") || "沒有任何項目被處理";
+}
+
 // ===== 查詢工具 =====
 
 server.tool(
@@ -408,24 +429,14 @@ server.tool(
     uncomplete: z.boolean().optional().default(false).describe("true = 反向操作，把已完成改回未完成"),
   },
   async ({ taskId, taskIds, uncomplete }) => {
-    const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
-    if (!ids.length) return text("❌ 請提供 taskId 或 taskIds");
-
-    const done: string[] = [];
-    const failed: string[] = [];
-    for (const id of ids) {
-      try {
-        const t = uncomplete ? await api.uncompleteTask(id) : await api.completeTask(id);
-        if (t) done.push(t.name);
-        else failed.push(`${id.slice(0, 8)}… 找不到`);
-      } catch (e) {
-        failed.push(`${id.slice(0, 8)}… ${e instanceof Error ? e.message : String(e)}`);
-      }
+    try {
+      const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
+      if (!ids.length) return text("❌ 請提供 taskId 或 taskIds");
+      const r = uncomplete ? await api.uncompleteTasks(ids) : await api.completeTasks(ids);
+      return text(batchReport(uncomplete ? "恢復未完成" : "完成", r));
+    } catch (error) {
+      return text(errorText(error));
     }
-    const verb = uncomplete ? "恢復未完成" : "完成";
-    let out = done.length ? `✅ 已${verb} ${done.length} 個（server 已確認）：\n${done.map((n) => "  · " + n).join("\n")}` : "";
-    if (failed.length) out += `${out ? "\n\n" : ""}❌ 失敗 ${failed.length} 個：\n${failed.map((f) => "  · " + f).join("\n")}`;
-    return text(out);
   }
 );
 
@@ -437,23 +448,13 @@ server.tool(
     taskIds: z.array(z.string()).optional().describe("任務 ID 陣列（批次）"),
   },
   async ({ taskId, taskIds }) => {
-    const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
-    if (!ids.length) return text("❌ 請提供 taskId 或 taskIds");
-
-    const done: string[] = [];
-    const failed: string[] = [];
-    for (const id of ids) {
-      try {
-        const t = await api.deleteTask(id);
-        if (t) done.push(t.name);
-        else failed.push(`${id.slice(0, 8)}… 找不到`);
-      } catch (e) {
-        failed.push(`${id.slice(0, 8)}… ${e instanceof Error ? e.message : String(e)}`);
-      }
+    try {
+      const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
+      if (!ids.length) return text("❌ 請提供 taskId 或 taskIds");
+      return text(batchReport("刪除", await api.deleteTasks(ids)));
+    } catch (error) {
+      return text(errorText(error));
     }
-    let out = done.length ? `✅ 已刪除 ${done.length} 個（server 已確認）：\n${done.map((n) => "  · " + n).join("\n")}` : "";
-    if (failed.length) out += `${out ? "\n\n" : ""}❌ 失敗 ${failed.length} 個：\n${failed.map((f) => "  · " + f).join("\n")}`;
-    return text(out);
   }
 );
 

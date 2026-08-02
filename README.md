@@ -33,7 +33,9 @@ MCP (Model Context Protocol) Server for [Focus To-Do (專注清單)](https://www
 | `focustodo_update_subtask` | 子任務改名 / 完成 / 刪除 |
 | `focustodo_create_project` | 建立新清單或新標籤 |
 
-所有寫入操作完成後會用獨立 clientId 跑 delta sync 向 server 驗證，回 ✅ 代表 server 真的持久化了。
+所有寫入操作完成後會用獨立 clientId 跑 delta sync 向 server 驗證，回 ✅ 代表 server 真的持久化了。驗證沒過的項目會把本地快取還原成原值，不會留下一個從未生效的狀態。
+
+批次操作（`tasks` 陣列、`taskIds` 陣列）是一次 sync 推送全部、一次 delta 驗證全部，耗時與筆數幾乎無關（實測 6 筆 1.8 秒）。單筆全部失敗會 throw，部分失敗則逐項回報哪些過、哪些沒過。
 
 ## Setup
 
@@ -86,6 +88,8 @@ MCP 設定（Claude Code `.mcp.json` 或 Claude Desktop config）：
 ### 收件匣與孤兒卡
 
 沒指定清單的任務會落在收件匣（magic id `id-task-tasks`），App 看得到。
+
+⚠️ 收件匣**不是**一個真的 project，`/v64/sync` 的 `projects` 陣列裡沒有它。本 server 在 enrich 時特別補上「收件匣」這個名稱，也接受用「收件匣 / 收件箱 / inbox」當 `projectName` 查詢。少了這層處理，落在收件匣的任務（本帳號 183 筆）在任何列表裡都顯示不出歸屬。
 
 ⚠️ 若 `projectId` 是**空字串**會變成「真孤兒」：server 上存在，但 App 任何視圖（清單、搜尋、收件匣）都不顯示，使用者無法操作。v2.0.0 起 `create_task` 一律 fallback 到收件匣，不會再產生孤兒；`list_tasks` / `search_tasks` 預設濾掉歷史殘留的孤兒卡（`includeOrphans: true` 才看得到）。
 
