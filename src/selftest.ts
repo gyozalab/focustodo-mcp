@@ -167,6 +167,24 @@ async function main() {
     assert.equal((await fromServer(createdIds[1]))!.priority, 2);
   });
 
+  // 這一項是 2026-04-29 事故的迴歸測試。當時 server 的寫入可見延遲暫時拉長，
+  // verify 等 1500ms 沒看到就報「server reject」，據此推論出並不存在的
+  // 「anti-tampering 鎖」。校準用：確認 verify 的等待預算對實際延遲仍有裕度。
+  await check("寫入可見延遲仍遠低於 verify 的等待預算", async () => {
+    const id = createdIds[1];
+    const marker = `[MCP自測] 延遲校準 ${Date.now() % 100000}`;
+    const t0 = Date.now();
+    await api.updateTask(id, { name: marker });
+    const roundTrip = Date.now() - t0;
+
+    await verifier.refresh();
+    assert.equal((await verifier.getTaskById(id))!.name, marker, "server 應存到新名稱");
+    // updateTask 內含一次 sync + 首輪 600ms 等待 + 一次 delta。沒有重試的話
+    // 應該落在 3 秒內；超過就代表 server 變慢，等待預算該重新檢討。
+    assert.ok(roundTrip < 3000, `單筆寫入含驗證耗時 ${roundTrip}ms，超過 3 秒代表 server 變慢`);
+    console.log(`     （單筆寫入含驗證 ${roundTrip}ms）`);
+  });
+
   await check("批次刪除 3 個，server 確認且不再出現在清單", async () => {
     const r = await api.deleteTasks(createdIds);
     assert.equal(r.failed.length, 0, `不該有失敗：${JSON.stringify(r.failed)}`);

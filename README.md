@@ -93,11 +93,26 @@ MCP 設定（Claude Code `.mcp.json` 或 Claude Desktop config）：
 
 ⚠️ 若 `projectId` 是**空字串**會變成「真孤兒」：server 上存在，但 App 任何視圖（清單、搜尋、收件匣）都不顯示，使用者無法操作。v2.0.0 起 `create_task` 一律 fallback 到收件匣，不會再產生孤兒；`list_tasks` / `search_tasks` 預設濾掉歷史殘留的孤兒卡（`includeOrphans: true` 才看得到）。
 
-### 關於「無法修改既有任務」
+### 關於「anti-tampering 鎖」（已證實不存在）
 
-v1.2.x 的 README 曾記載 server 對既有任務有 anti-tampering 鎖、MCP 只能讀與新建。**2026-08-02 實測已推翻**：4 種 client/timestamp 組合下的 update、complete、delete 全部寫入並持久化，番茄鐘與清單的建立、刪除同樣生效。
+v1.2.x 的 README 曾記載 server 對既有任務有 anti-tampering 鎖、MCP 只能讀與新建。**這個結論是錯的**，2026-08-02 完整追查後撤銷。
 
-寫入驗證機制（v1.2.0 引入）予以保留 —— 寫入成功與否不該靠猜。
+實際的事故鏈：
+
+1. 2026-04-29 server 端寫入的**可見性**暫時延遲
+2. v1.2.0 的 verify 推送後只等 1500ms，delta 沒看到就報 `server 沒收到`
+3. 從這個錯誤訊息反推出「server 有 anti-tampering 鎖」
+4. 佐證用的三個 probe **全部只測同一張卡**，而那張是最異常的樣本（`projectId=""` 的真孤兒）
+5. fullSync 明明顯示寫入已生效，卻被「fullSync 只是 echo、不代表持久化」的理論駁回（當年的 probe 甚至印出了「anti-tampering 假設可能不對」的提示，仍被忽略）
+
+追查證據：當年那張測試卡如今在 server 上是 `projectId="id-task-tasks"`、`isDeleted=true`、名稱帶 `[TEST-MARKER]`——**三個被判定為「遭拒絕」的寫入，最後全部落地了**。所謂的鎖從來不存在，只是寫入慢了一拍。
+
+順帶更正另外兩個誤傳的細節：
+
+- **delta sync 不會過濾「自己 push 的變動」**。實測同 client 同 clientId、異 client、新 clientId 四種組合都看得到。
+- **fullSync 不是 echo artifact**，它回的就是持久層真實狀態。
+
+現在的 verify 改成退避重試（600ms → 1.8s → 5.4s），且窮盡重試後的措辭是「無法確認」而非「被拒絕」，本地快取也只標記失效、不臆測結果。`npm run selftest` 有一項專門校準寫入可見延遲，server 變慢會被測出來，而不是再次被誤讀成 server 拒絕寫入。
 
 ## License
 

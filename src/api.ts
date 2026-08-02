@@ -30,6 +30,12 @@ const CACHE_TTL_MS = 60_000;
 const STATE_ACTIVE = 0;
 const STATE_DELETED = -1;
 
+/** 寫入後多久去確認。實測 server 的可見延遲約 400ms，600ms 起跳留了裕度。 */
+const VERIFY_BASE_DELAY_MS = 600;
+/** 看不到就退避重試（600ms → 1.8s → 5.4s，累計約 7.8 秒才放棄）。 */
+const VERIFY_ATTEMPTS = 3;
+const VERIFY_TOTAL_WAIT_LABEL = "約 8 秒";
+
 /** fetch with AbortController timeout */
 async function fetchWithTimeout(
   url: string,
@@ -494,11 +500,9 @@ export class FocusToDoAPI {
       pushedAt
     );
     if (rejected.length) {
-      // 沒進 server 的不要留在快取裡假裝存在
-      const bad = new Set(rejected.map((r) => r.id));
-      this._tasks = this._tasks.filter((t) => !bad.has(t.id));
+      this.lastFetchedAt = 0; // 結果未知，下次查詢重新向 server 確認
       throw new Error(
-        `${rejected.length}/${built.length} 個任務 server 未確認：` +
+        `${rejected.length}/${built.length} 個任務無法確認：` +
         rejected.map((r) => r.reason).join("; ")
       );
     }
@@ -573,11 +577,10 @@ export class FocusToDoAPI {
       pushedAt
     );
 
-    // Server 拒收的要把快取還原成原值，否則後續查詢會回報一個從未生效的狀態
+    // 沒確認到的不能假裝知道結果。回滾成舊值等於斷定「寫入失敗」，但真相未知
+    // （很可能只是 server 還沒可見）。讓快取失效，下次查詢直接向 server 要答案。
     const rejectedIds = new Set(rejected.map((r) => r.id));
-    for (const { task } of staged) {
-      if (rejectedIds.has(task.id)) this.mergeArray(this._tasks, [task]);
-    }
+    if (rejectedIds.size) this.lastFetchedAt = 0;
 
     return {
       updated: pushed.filter((t) => !rejectedIds.has(t.id)),
@@ -619,11 +622,15 @@ export class FocusToDoAPI {
   }
 
   /**
-   * 用獨立 clientId 拉 delta，讀 server 的真實持久層狀態。
+   * 拉 delta，讀 server 的真實持久層狀態。
    *
-   * ⚠️ 一定要用 delta 不能用 fullSync — fullSync 會把 client 剛 push 的內容
-   * 原樣 mirror 回來，就算 server 根本沒存也看起來像成功。
-   * clientId 也必須是新的，否則 server 會過濾掉「自己 push 的變動」。
+   * 用 delta 而非 fullSync：fullSync 回應包含全部 1600+ 筆任務，光傳輸就 2MB，
+   * 拿來驗證單筆寫入太重。
+   *
+   * 註：舊版註解聲稱「clientId 必須是新的，否則 server 會過濾掉自己 push 的
+   * 變動」，2026-08-02 實測為誤——同 client 同 clientId、異 client、新 clientId
+   * 四種組合都看得到自己剛 push 的變動，server 不做這層過濾。這裡仍用新
+   * clientId，因為沒有理由讓驗證讀取去動到 this.clientId 的同步游標。
    */
   private async fetchDelta(sinceMs: number): Promise<SyncResponse> {
     const creds = await this.ensureAuth();
@@ -655,6 +662,16 @@ export class FocusToDoAPI {
   /**
    * Post-write verification：確認變更真的落到 server。
    * 回傳沒通過的項目（不 throw），讓呼叫端決定怎麼報告部分失敗。
+   *
+   * ⚠️ 會重試，不要改回「等一次就判死刑」。
+   *
+   * 2026-04-29 的事故就是這樣來的：server 那天寫入可見性延遲，verify 等
+   * 1500ms 沒看到就報 `server reject`，於是從錯誤訊息反推出「FocusTodo 有
+   * anti-tampering 鎖、MCP 只能讀與新建」的結論，寫進 README 和 memory 流傳
+   * 三個月。事後查證，那些「被拒絕」的寫入全部都持久化了。
+   *
+   * 「還沒看到」不等於「被拒絕」。看不到就退避重試，重試完仍看不到也只能
+   * 說「無法確認」，不能宣稱 server 拒絕。
    */
   private async verifyApplied(
     kind: "tasks" | "subtasks" | "pomodoros" | "projects",
@@ -663,32 +680,48 @@ export class FocusToDoAPI {
   ): Promise<{ id: string; reason: string }[]> {
     if (!expectations.length) return [];
 
-    await new Promise((r) => setTimeout(r, 1500));
-    const data = await this.fetchDelta(pushedAt - 5000);
-    const rows = (data[kind] || []) as { id: string }[];
+    let pending = expectations;
+    const mismatched = new Map<string, string>();
 
-    const rejected: { id: string; reason: string }[] = [];
-    for (const { id, fields } of expectations) {
-      const echoed = rows.find((r) => r.id === id);
-      if (!echoed) {
-        rejected.push({
-          id,
-          reason: `Server 沒收到此變更。本地與 server 可能不一致，請重新查詢或改在 App 內操作。`,
-        });
-        continue;
-      }
-      const mismatches: string[] = [];
-      for (const [key, expected] of Object.entries(fields)) {
-        const actual = (echoed as unknown as Record<string, unknown>)[key];
-        if (actual !== expected) {
-          mismatches.push(`${key}: 期望=${JSON.stringify(expected)} 實際=${JSON.stringify(actual)}`);
+    for (let attempt = 0; attempt < VERIFY_ATTEMPTS && pending.length; attempt++) {
+      await new Promise((r) => setTimeout(r, VERIFY_BASE_DELAY_MS * 3 ** attempt));
+
+      const data = await this.fetchDelta(pushedAt - 5000);
+      const rows = (data[kind] || []) as { id: string }[];
+      const stillPending: typeof pending = [];
+
+      for (const item of pending) {
+        const echoed = rows.find((r) => r.id === item.id);
+        if (!echoed) {
+          stillPending.push(item); // 還沒可見，下一輪再看
+          continue;
         }
+        const mismatches: string[] = [];
+        for (const [key, expected] of Object.entries(item.fields)) {
+          const actual = (echoed as unknown as Record<string, unknown>)[key];
+          if (actual !== expected) {
+            mismatches.push(`${key}: 期望=${JSON.stringify(expected)} 實際=${JSON.stringify(actual)}`);
+          }
+        }
+        // 欄位不符代表 server 真的存了別的值，這是確定的失敗，不必再重試
+        if (mismatches.length) mismatched.set(item.id, mismatches.join("; "));
       }
-      if (mismatches.length) {
-        rejected.push({ id, reason: `Server 收到變動但欄位不符：${mismatches.join("; ")}` });
-      }
+      pending = stillPending;
     }
-    return rejected;
+
+    return [
+      ...pending.map((p) => ({
+        id: p.id,
+        reason:
+          `無法確認 server 是否已套用（等待 ${VERIFY_TOTAL_WAIT_LABEL} 仍未在同步資料中出現）。` +
+          `這通常是 server 寫入延遲，不代表被拒絕——變更很可能稍後就會生效。` +
+          `請重新查詢確認，不要重複送出。`,
+      })),
+      ...[...mismatched].map(([id, reason]) => ({
+        id,
+        reason: `Server 存的值與送出的不符：${reason}`,
+      })),
+    ];
   }
 
   /** 驗證單筆寫入，沒過就 throw */
