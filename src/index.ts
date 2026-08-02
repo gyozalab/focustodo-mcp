@@ -9,7 +9,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { FocusToDoAPI } from "./api.js";
+import { FocusToDoAPI, parseDeadline, todayBounds } from "./api.js";
 import type { EnrichedTask } from "./types.js";
 
 const account = process.env.FOCUSTODO_ACCOUNT;
@@ -24,7 +24,7 @@ const api = new FocusToDoAPI(account, password);
 
 const server = new McpServer({
   name: "focustodo",
-  version: "1.2.1",
+  version: "2.0.0",
 });
 
 // ===== Helper =====
@@ -46,87 +46,110 @@ function formatDate(epochMs: number): string {
   });
 }
 
-const priorityLabels: Record<number, string> = {
-  0: "無",
-  1: "低",
-  2: "中",
-  3: "高",
-};
+const priorityLabels: Record<number, string> = { 0: "無", 1: "低", 2: "中", 3: "高" };
 
-/** Wrap a tool handler with try/catch to return structured errors */
+/** 任務單行摘要 */
+function taskLine(t: EnrichedTask, withId = true): string {
+  const status = t.isFinished ? "✅" : "⬜";
+  const prio = t.priority > 0 ? ` [${priorityLabels[t.priority]}]` : "";
+  const deadline = t.deadline ? ` 📅${formatDate(t.deadline)}` : "";
+  const pomo = t.estimatePomoNum > 0 ? ` 🍅${t.actualPomoNum}/${t.estimatePomoNum}` : "";
+  const tags = t.tagNames ? ` ${t.tagNames}` : "";
+  const proj = t.projectName ? ` | ${t.projectName}` : "";
+  return `${status} ${t.name}${prio}${pomo}${deadline}${tags}${proj}${withId ? `\n   id: ${t.id}` : ""}`;
+}
+
 function errorText(error: unknown): string {
   const msg = error instanceof Error ? error.message : String(error);
   return `❌ FocusTodo 錯誤：${msg}`;
 }
 
-// ===== Tools =====
+function text(t: string) {
+  return { content: [{ type: "text" as const, text: t }] };
+}
+
+// ===== 查詢工具 =====
 
 server.tool(
   "focustodo_list_projects",
-  "列出所有清單（如：工作 Work、書寫 Output、Blog 等）",
+  "列出所有清單與標籤（如：工作 Work、書寫 Output、Blog 等）。建任務前若不確定清單名稱，先呼叫這個。",
   {},
   async () => {
     try {
       const projects = await api.getProjects();
-      const lines = projects
-        .sort((a, b) => a.order - b.order)
-        .map((p) => {
-          const typeLabel = p.type === 3000 ? "標籤" : "清單";
-          return `- [${typeLabel}] ${p.name} (id: ${p.id})`;
-        });
-      return { content: [{ type: "text", text: `找到 ${projects.length} 個清單：\n${lines.join("\n")}` }] };
+      const lists = projects.filter((p) => p.type !== 3000).sort((a, b) => a.order - b.order);
+      const tags = projects.filter((p) => p.type === 3000).sort((a, b) => a.order - b.order);
+      let out = `📁 清單 (${lists.length})：\n`;
+      out += lists.map((p) => `- ${p.name}  (id: ${p.id})`).join("\n");
+      out += `\n\n🏷️ 標籤 (${tags.length})：\n`;
+      out += tags.map((p) => `- #${p.name}  (id: ${p.id})`).join("\n");
+      return text(out);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
   "focustodo_list_tasks",
-  "列出某個清單或標籤下的所有任務。這是查詢任務的主要工具 — 當使用者說「列出 Blog 任務」「書寫 Output 有什麼」等，請用此工具並傳入 projectName。⚠️ 預設會過濾掉「真孤兒」殭屍卡（projectId 為空、user 在 App 看不到也刪不掉），需要除錯時用 includeOrphans=true 才看得到。",
+  "列出任務，可依清單、標籤、優先級、完成狀態、到期日篩選。查詢任務的主要工具 —— 使用者說「列出 Blog 任務」「書寫 Output 有什麼」時用這個並傳 projectName。⚠️ 預設過濾「真孤兒」殭屍卡（projectId 為空、App 看不到），除錯才開 includeOrphans。",
   {
-    projectName: z.string().optional().describe("清單名稱（模糊匹配，如 'Blog'、'書寫'）"),
-    tag: z.string().optional().describe("標籤（如 '#Blog'、'#iPAS AI 中級'）"),
+    projectName: z.string().optional().describe("清單或標籤名稱（模糊匹配，如 'Blog'、'書寫'）"),
+    tag: z.string().optional().describe("只篩標籤（如 'Blog'、'iPAS AI 中級'）"),
     priority: z.number().min(0).max(3).optional().describe("優先級：0=無, 1=低, 2=中, 3=高"),
     isFinished: z.boolean().optional().describe("true=已完成, false=未完成"),
+    due: z.enum(["overdue", "today", "week"]).optional()
+      .describe("到期日篩選：overdue=已逾期未完成、today=今天到期、week=未來七天內到期"),
     limit: z.number().optional().default(20).describe("最多顯示幾筆（預設 20）"),
-    includeOrphans: z.boolean().optional().default(false).describe("是否包含真孤兒殭屍卡（projectId=空字串、App 看不到、無法 update/delete）。預設 false 隱藏。除錯或回顧歷史殘留才開 true。"),
+    includeOrphans: z.boolean().optional().default(false)
+      .describe("包含真孤兒殭屍卡（projectId 空字串、App 看不到）。除錯用。"),
   },
   async (params) => {
     try {
-      const tasks = await api.getTasks({
-        projectName: params.projectName,
-        tag: params.tag,
-        priority: params.priority,
-        isFinished: params.isFinished,
-        includeOrphans: params.includeOrphans,
-      });
-
+      const tasks = await api.getTasks(params);
       const sorted = tasks.sort((a, b) => {
         if (a.priority !== b.priority) return b.priority - a.priority;
         return b.creationDate - a.creationDate;
       });
-
       const limited = sorted.slice(0, params.limit);
-
-      const lines = limited.map((t: EnrichedTask) => {
-        const status = t.isFinished ? "✅" : "⬜";
-        const prio = t.priority > 0 ? ` [${priorityLabels[t.priority]}]` : "";
-        const deadline = t.deadline ? ` 📅${formatDate(t.deadline)}` : "";
-        const pomo = t.estimatePomoNum > 0 ? ` 🍅${t.actualPomoNum}/${t.estimatePomoNum}` : "";
-        const tags = t.tagNames ? ` ${t.tagNames}` : "";
-        const proj = t.projectName ? ` | ${t.projectName}` : "";
-        return `${status} ${t.name}${prio}${pomo}${deadline}${tags}${proj}\n   id: ${t.id}`;
-      });
-
-      return {
-        content: [{
-          type: "text",
-          text: `找到 ${tasks.length} 個任務（顯示前 ${limited.length} 個）：\n\n${lines.join("\n\n")}`,
-        }],
-      };
+      if (!limited.length) return text("沒有符合條件的任務。");
+      return text(
+        `找到 ${tasks.length} 個任務（顯示前 ${limited.length} 個）：\n\n` +
+        limited.map((t) => taskLine(t)).join("\n\n")
+      );
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
+    }
+  }
+);
+
+server.tool(
+  "focustodo_search_tasks",
+  "用關鍵字搜尋任務名稱、標籤和備註。要列出整個清單的任務請改用 focustodo_list_tasks。",
+  {
+    query: z.string().describe("搜尋關鍵字"),
+    includeFinished: z.boolean().optional().default(true).describe("是否包含已完成任務"),
+    limit: z.number().optional().default(10).describe("最多顯示幾筆"),
+  },
+  async ({ query, includeFinished, limit }) => {
+    try {
+      const tasks = await api.getTasks(includeFinished ? {} : { isFinished: false });
+      const q = query.toLowerCase();
+      const matched = tasks
+        .filter(
+          (t) =>
+            t.name.toLowerCase().includes(q) ||
+            t.tagNames?.toLowerCase().includes(q) ||
+            t.remark?.toLowerCase().includes(q)
+        )
+        .sort((a, b) => b.creationDate - a.creationDate)
+        .slice(0, limit);
+      if (!matched.length) return text(`搜尋「${query}」沒有找到任務。`);
+      return text(
+        `搜尋「${query}」找到 ${matched.length} 個：\n\n` + matched.map((t) => taskLine(t)).join("\n\n")
+      );
+    } catch (error) {
+      return text(errorText(error));
     }
   }
 );
@@ -134,177 +157,334 @@ server.tool(
 server.tool(
   "focustodo_get_task_detail",
   "查看單一任務的完整詳情（含子任務和番茄鐘記錄）",
-  {
-    taskId: z.string().describe("任務 ID"),
-  },
+  { taskId: z.string().describe("任務 ID") },
   async ({ taskId }) => {
     try {
-      // get_task_detail 透過 ID 精確查詢，包含孤兒卡讓除錯時能看到完整資料
-      const tasks = await api.getTasks({ includeDeleted: false, includeOrphans: true });
-      const task = tasks.find((t) => t.id === taskId);
-      if (!task) {
-        return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
-      }
+      const task = await api.getTaskById(taskId);
+      if (!task) return text(`找不到任務 ${taskId}`);
 
       const subtasks = await api.getSubtasks(taskId);
       const pomodoros = await api.getPomodoros({ taskId });
-
       const totalFocus = pomodoros.reduce((sum, p) => sum + p.interval, 0);
 
-      let text = `📋 ${task.name}\n`;
-      text += `狀態: ${task.isFinished ? "已完成" : "進行中"}\n`;
-      text += `清單: ${task.projectName || "未分類"}\n`;
-      text += `優先級: ${priorityLabels[task.priority]}\n`;
-      text += `番茄: ${task.actualPomoNum}/${task.estimatePomoNum} (每個 ${task.pomodoroInterval / 60} 分鐘)\n`;
-      text += `已專注: ${formatSeconds(totalFocus)}\n`;
-      text += `到期日: ${formatDate(task.deadline)}\n`;
-      text += `標籤: ${task.tags || "無"}\n`;
-      text += `建立日期: ${formatDate(task.creationDate)}\n`;
+      let out = `📋 ${task.name}\n`;
+      out += `狀態: ${task.isDeleted ? "已刪除" : task.isFinished ? "已完成" : "進行中"}\n`;
+      out += `清單: ${task.projectName || "未分類"}\n`;
+      out += `優先級: ${priorityLabels[task.priority]}\n`;
+      out += `番茄: ${task.actualPomoNum}/${task.estimatePomoNum} (每個 ${task.pomodoroInterval / 60} 分鐘)\n`;
+      out += `已專注: ${formatSeconds(totalFocus)}\n`;
+      out += `到期日: ${formatDate(task.deadline)}\n`;
+      out += `標籤: ${task.tagNames || "無"}\n`;
+      out += `建立日期: ${formatDate(task.creationDate)}\n`;
+      if (task.remark) out += `\n備註:\n${task.remark}\n`;
 
-      if (task.remark) {
-        text += `\n備註:\n${task.remark}\n`;
-      }
-
-      if (subtasks.length > 0) {
-        text += `\n子任務 (${subtasks.length}):\n`;
+      if (subtasks.length) {
+        out += `\n子任務 (${subtasks.length}):\n`;
         for (const s of subtasks.sort((a, b) => a.order - b.order)) {
-          text += `  ${s.isFinished ? "✅" : "⬜"} ${s.name}\n`;
+          out += `  ${s.isFinished ? "✅" : "⬜"} ${s.name}  (id: ${s.id})\n`;
         }
       }
-
-      if (pomodoros.length > 0) {
-        text += `\n最近 5 個番茄鐘:\n`;
-        const recent = pomodoros.sort((a, b) => b.endDate - a.endDate).slice(0, 5);
-        for (const p of recent) {
-          text += `  🍅 ${formatDate(p.endDate)} - ${formatSeconds(p.interval)}\n`;
+      if (pomodoros.length) {
+        out += `\n最近 5 個番茄鐘:\n`;
+        for (const p of pomodoros.sort((a, b) => b.endDate - a.endDate).slice(0, 5)) {
+          out += `  🍅 ${formatDate(p.endDate)} - ${formatSeconds(p.interval)}${p.isManual ? "（手動補記）" : ""}\n`;
         }
       }
-
-      return { content: [{ type: "text", text }] };
+      return text(out);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
-  "focustodo_create_task",
-  "新增一個任務到指定清單",
+  "focustodo_get_today_focus",
+  "今日總覽：已專注時間、今天到期的任務、逾期未完成的任務。使用者問「今天做什麼」「今天專注多久」「有什麼逾期」時用這個。",
+  {},
+  async () => {
+    try {
+      const [focus, dueToday, overdue] = await Promise.all([
+        api.getTodayFocus(),
+        api.getTasks({ due: "today", isFinished: false }),
+        api.getTasks({ due: "overdue", isFinished: false }),
+      ]);
+
+      let out = `📊 今日專注：${formatSeconds(focus.focusTime)}　🍅 ${focus.pomodoros} 個番茄\n`;
+      if (focus.tasks.length) {
+        out += `\n專注明細:\n`;
+        for (const t of focus.tasks) {
+          out += `  🍅 ${t.name} - ${formatSeconds(t.focusTime)} (${t.pomodoros} 個)\n`;
+        }
+      } else {
+        out += `\n今天還沒有專注記錄。\n`;
+      }
+
+      out += `\n📅 今天到期 (${dueToday.length}):\n`;
+      out += dueToday.length
+        ? dueToday.map((t) => "  " + taskLine(t, false)).join("\n") + "\n"
+        : "  無\n";
+
+      out += `\n🔴 已逾期 (${overdue.length}):\n`;
+      out += overdue.length
+        ? overdue
+            .sort((a, b) => a.deadline - b.deadline)
+            .slice(0, 10)
+            .map((t) => "  " + taskLine(t, false))
+            .join("\n") + (overdue.length > 10 ? `\n  …還有 ${overdue.length - 10} 個` : "") + "\n"
+        : "  無\n";
+
+      return text(out);
+    } catch (error) {
+      return text(errorText(error));
+    }
+  }
+);
+
+server.tool(
+  "focustodo_get_stats",
+  "查詢專注統計（可按時間範圍和清單篩選），含每日分佈。",
   {
-    name: z.string().describe("任務名稱"),
-    projectName: z.string().optional().describe("清單名稱（如 'Blog'、'書寫 Output'）"),
-    tags: z.string().optional().describe("標籤（如 '#Blog #iPAS'）"),
-    priority: z.number().min(0).max(3).optional().describe("優先級：0=無, 1=低, 2=中, 3=高"),
-    estimatePomoNum: z.number().optional().describe("預估番茄數"),
-    deadline: z.string().optional().describe("到期日（ISO 格式如 '2026-03-29'）"),
-    remark: z.string().optional().describe("備註內容"),
+    period: z.enum(["today", "this_week", "this_month", "last_7_days", "last_30_days", "all"])
+      .optional().default("this_week").describe("時間範圍"),
+    projectName: z.string().optional().describe("清單或標籤名稱（如 'Blog'）"),
+    showDaily: z.boolean().optional().default(true).describe("是否顯示每日分佈"),
   },
   async (params) => {
     try {
-      const deadline = params.deadline ? new Date(params.deadline).getTime() : undefined;
+      const now = new Date();
+      let startDate: number | undefined;
+      switch (params.period) {
+        case "today":
+          startDate = todayBounds().start;
+          break;
+        case "this_week": {
+          const d = new Date(now);
+          d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // 週一為起點
+          d.setHours(0, 0, 0, 0);
+          startDate = d.getTime();
+          break;
+        }
+        case "this_month":
+          startDate = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+          break;
+        case "last_7_days":
+          startDate = todayBounds().start - 6 * 86400000;
+          break;
+        case "last_30_days":
+          startDate = todayBounds().start - 29 * 86400000;
+          break;
+      }
 
-      const task = await api.createTask({
-        name: params.name,
-        projectName: params.projectName,
-        tags: params.tags,
-        priority: params.priority,
-        estimatePomoNum: params.estimatePomoNum,
-        deadline,
-        remark: params.remark,
-      });
+      const stats = await api.getStats({ startDate, projectName: params.projectName });
 
-      return {
-        content: [{
-          type: "text",
-          text: `✅ 已建立任務「${task.name}」\nID: ${task.id}\n清單: ${params.projectName || "預設"}\n優先級: ${priorityLabels[params.priority ?? 0]}\n番茄數: ${params.estimatePomoNum ?? 0}`,
-        }],
-      };
+      let out = `📊 專注統計（${params.period}${params.projectName ? ` · ${params.projectName}` : ""}）\n\n`;
+      out += `總專注時間: ${formatSeconds(stats.totalFocusTime)}\n`;
+      out += `番茄鐘數: ${stats.totalPomodoros} 個\n`;
+      out += `完成任務: ${stats.completedTasks} 個\n`;
+      out += `待完成任務: ${stats.pendingTasks} 個\n`;
+
+      if (stats.projectBreakdown.length) {
+        out += `\n📁 清單時間分佈:\n`;
+        for (const p of stats.projectBreakdown.slice(0, 10)) {
+          out += `  ${p.name}: ${formatSeconds(p.focusTime)} (${p.pomodoros} 個番茄)\n`;
+        }
+      }
+      if (params.showDaily && stats.dailyBreakdown.length) {
+        const recent = stats.dailyBreakdown.slice(-14);
+        const max = Math.max(...recent.map((d) => d.focusTime), 1);
+        out += `\n📈 每日分佈（最近 ${recent.length} 天）:\n`;
+        for (const d of recent) {
+          const bar = "█".repeat(Math.max(1, Math.round((d.focusTime / max) * 20)));
+          out += `  ${d.date} ${bar} ${formatSeconds(d.focusTime)}\n`;
+        }
+      }
+      return text(out);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
+    }
+  }
+);
+
+// ===== 寫入工具 =====
+
+const taskInput = {
+  name: z.string().describe("任務名稱"),
+  projectName: z.string().optional()
+    .describe("清單名稱（如 'Blog'、'書寫 Output'）。省略則落在收件匣。找不到會報錯，不會靜默丟失。"),
+  tags: z.string().optional().describe("標籤名稱，逗號或空白分隔（如 'Blog, iPAS'）。必須是已存在的標籤。"),
+  priority: z.number().min(0).max(3).optional().describe("優先級：0=無, 1=低, 2=中, 3=高"),
+  estimatePomoNum: z.number().optional().describe("預估番茄數"),
+  deadline: z.string().optional().describe("到期日（'2026-08-05' 會設成當天 23:59:59）"),
+  remark: z.string().optional().describe("備註內容"),
+};
+
+server.tool(
+  "focustodo_create_task",
+  "新增任務。單筆填 name 等欄位；多筆一次建立請用 tasks 陣列（開工排本週時用這個，一次呼叫建完）。清單名稱找不到會直接報錯，不會變成 App 看不到的孤兒卡。",
+  {
+    name: taskInput.name.optional(),
+    projectName: taskInput.projectName,
+    tags: taskInput.tags,
+    priority: taskInput.priority,
+    estimatePomoNum: taskInput.estimatePomoNum,
+    deadline: taskInput.deadline,
+    remark: taskInput.remark,
+    tasks: z.array(z.object(taskInput)).optional().describe("批次建立多個任務"),
+  },
+  async (params) => {
+    try {
+      const items = params.tasks?.length
+        ? params.tasks
+        : params.name
+          ? [{ ...params, name: params.name, tasks: undefined }]
+          : null;
+      if (!items) return text("❌ 請提供 name（單筆）或 tasks 陣列（批次）");
+
+      const created = await api.createTasks(
+        items.map((i) => ({
+          name: i.name,
+          projectName: i.projectName,
+          tags: i.tags,
+          priority: i.priority,
+          estimatePomoNum: i.estimatePomoNum,
+          deadline: i.deadline ? parseDeadline(i.deadline) : undefined,
+          remark: i.remark,
+        }))
+      );
+
+      const lines = created.map((t, i) => {
+        const src = items[i];
+        return `  ✅ ${t.name}${src.projectName ? ` → ${src.projectName}` : " → 收件匣"}\n     id: ${t.id}`;
+      });
+      return text(`已建立 ${created.length} 個任務：\n${lines.join("\n")}`);
+    } catch (error) {
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
   "focustodo_update_task",
-  "修改任務的名稱、優先級、到期日、標籤等。⚠️ 重要：FocusTodo server 對修改既有任務有 anti-tampering 鎖，本工具會 post-write 驗證，server 沒接受就 throw 錯誤。回 ✅ 才代表 server 真的更新了。",
+  "修改任務的名稱、優先級、到期日、標籤、所屬清單、備註。寫入後會向 server 驗證，回 ✅ 才代表真的更新了。",
   {
     taskId: z.string().describe("任務 ID"),
     name: z.string().optional().describe("新名稱"),
-    tags: z.string().optional().describe("新標籤"),
+    projectName: z.string().optional().describe("搬到哪個清單（清單名稱）"),
+    tags: z.string().optional().describe("新標籤（名稱，逗號分隔）。傳空字串清除標籤。"),
     priority: z.number().min(0).max(3).optional().describe("新優先級"),
     estimatePomoNum: z.number().optional().describe("新預估番茄數"),
-    deadline: z.string().optional().describe("新到期日（ISO 格式）"),
+    deadline: z.string().optional().describe("新到期日（'2026-08-05'，傳空字串清除）"),
     remark: z.string().optional().describe("新備註"),
   },
   async (params) => {
     try {
       const updates: Record<string, unknown> = {};
       if (params.name !== undefined) updates.name = params.name;
+      if (params.projectName !== undefined) updates.projectName = params.projectName;
       if (params.tags !== undefined) updates.tags = params.tags;
       if (params.priority !== undefined) updates.priority = params.priority;
       if (params.estimatePomoNum !== undefined) updates.estimatePomoNum = params.estimatePomoNum;
-      if (params.deadline !== undefined) updates.deadline = new Date(params.deadline).getTime();
+      if (params.deadline !== undefined) {
+        updates.deadline = params.deadline ? parseDeadline(params.deadline) : 0;
+      }
       if (params.remark !== undefined) updates.remark = params.remark;
+      if (!Object.keys(updates).length) return text("❌ 沒有指定任何要修改的欄位");
 
       const task = await api.updateTask(params.taskId, updates);
-      if (!task) {
-        return { content: [{ type: "text", text: `找不到任務 ${params.taskId}` }] };
-      }
-
-      return {
-        content: [{
-          type: "text",
-          text: `✅ 已更新任務「${task.name}」（server 已確認）\n更新欄位: ${Object.keys(updates).join(", ")}`,
-        }],
-      };
+      if (!task) return text(`找不到任務 ${params.taskId}`);
+      return text(`✅ 已更新「${task.name}」（server 已確認）\n修改欄位: ${Object.keys(updates).join(", ")}`);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
   "focustodo_complete_task",
-  "將任務標記為已完成。⚠️ 同 update_task：post-write 驗證，server 沒接受就 throw。回 ✅ 才代表真完成。",
+  "標記任務完成。可一次傳多個 taskIds 批次完成。寫入後向 server 驗證，回 ✅ 才代表真完成。",
   {
-    taskId: z.string().describe("任務 ID"),
+    taskId: z.string().optional().describe("任務 ID（單筆）"),
+    taskIds: z.array(z.string()).optional().describe("任務 ID 陣列（批次）"),
+    uncomplete: z.boolean().optional().default(false).describe("true = 反向操作，把已完成改回未完成"),
   },
-  async ({ taskId }) => {
-    try {
-      const task = await api.completeTask(taskId);
-      if (!task) {
-        return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
+  async ({ taskId, taskIds, uncomplete }) => {
+    const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
+    if (!ids.length) return text("❌ 請提供 taskId 或 taskIds");
+
+    const done: string[] = [];
+    const failed: string[] = [];
+    for (const id of ids) {
+      try {
+        const t = uncomplete ? await api.uncompleteTask(id) : await api.completeTask(id);
+        if (t) done.push(t.name);
+        else failed.push(`${id.slice(0, 8)}… 找不到`);
+      } catch (e) {
+        failed.push(`${id.slice(0, 8)}… ${e instanceof Error ? e.message : String(e)}`);
       }
-      return { content: [{ type: "text", text: `✅ 已完成任務「${task.name}」（server 已確認）` }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
     }
+    const verb = uncomplete ? "恢復未完成" : "完成";
+    let out = done.length ? `✅ 已${verb} ${done.length} 個（server 已確認）：\n${done.map((n) => "  · " + n).join("\n")}` : "";
+    if (failed.length) out += `${out ? "\n\n" : ""}❌ 失敗 ${failed.length} 個：\n${failed.map((f) => "  · " + f).join("\n")}`;
+    return text(out);
   }
 );
 
 server.tool(
   "focustodo_delete_task",
-  "刪除任務（軟刪除）。⚠️ FocusTodo server 對既有任務有 anti-tampering 鎖。本工具會 post-write 驗證，server 沒接受就 throw 錯誤。回 ✅ 才代表 server 真的刪了；🚫 失敗時請告知使用者用 FocusTodo App 操作。",
+  "刪除任務（軟刪除）。可一次傳多個 taskIds 批次刪除。寫入後向 server 驗證，回 ✅ 才代表真的刪了。",
+  {
+    taskId: z.string().optional().describe("任務 ID（單筆）"),
+    taskIds: z.array(z.string()).optional().describe("任務 ID 陣列（批次）"),
+  },
+  async ({ taskId, taskIds }) => {
+    const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
+    if (!ids.length) return text("❌ 請提供 taskId 或 taskIds");
+
+    const done: string[] = [];
+    const failed: string[] = [];
+    for (const id of ids) {
+      try {
+        const t = await api.deleteTask(id);
+        if (t) done.push(t.name);
+        else failed.push(`${id.slice(0, 8)}… 找不到`);
+      } catch (e) {
+        failed.push(`${id.slice(0, 8)}… ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    let out = done.length ? `✅ 已刪除 ${done.length} 個（server 已確認）：\n${done.map((n) => "  · " + n).join("\n")}` : "";
+    if (failed.length) out += `${out ? "\n\n" : ""}❌ 失敗 ${failed.length} 個：\n${failed.map((f) => "  · " + f).join("\n")}`;
+    return text(out);
+  }
+);
+
+server.tool(
+  "focustodo_log_pomodoro",
+  "補記一段已完成的專注時間到任務上，同時累加該任務的番茄計數。FocusTodo 沒有 server 端的「計時中」狀態，所以只能記錄已結束的專注（例如：忘了開計時器、或在別處專注完想補登）。",
   {
     taskId: z.string().describe("任務 ID"),
+    minutes: z.number().positive().describe("專注了幾分鐘"),
+    endedAt: z.string().optional().describe("結束時間（ISO 格式，如 '2026-08-02T15:30'）。省略則用現在。"),
   },
-  async ({ taskId }) => {
+  async ({ taskId, minutes, endedAt }) => {
     try {
-      const task = await api.deleteTask(taskId);
-      if (!task) {
-        return { content: [{ type: "text", text: `找不到任務 ${taskId}` }] };
-      }
-      return { content: [{ type: "text", text: `✅ 已刪除任務「${task.name}」（server 已確認）` }] };
+      const endDate = endedAt ? new Date(endedAt).getTime() : undefined;
+      if (endedAt && Number.isNaN(endDate!)) return text(`❌ 無法解析時間：${endedAt}`);
+      const pomo = await api.logPomodoro({ taskId, minutes, endDate });
+      const task = await api.getTaskById(taskId);
+      return text(
+        `✅ 已補記 ${formatSeconds(pomo.interval)} 專注到「${task?.name}」\n` +
+        `結束時間: ${new Date(pomo.endDate).toLocaleString("zh-TW")}\n` +
+        `該任務累計番茄: ${task?.actualPomoNum}`
+      );
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
   "focustodo_create_subtask",
-  "為任務新增子任務",
+  "為任務新增子任務（會自動把父任務標記為含子任務，否則 App 不顯示）",
   {
     taskId: z.string().describe("父任務 ID"),
     name: z.string().describe("子任務名稱"),
@@ -313,136 +493,66 @@ server.tool(
   async (params) => {
     try {
       const subtask = await api.createSubtask(params);
-      return {
-        content: [{
-          type: "text",
-          text: `✅ 已建立子任務「${subtask.name}」\nID: ${subtask.id}`,
-        }],
-      };
+      return text(`✅ 已建立子任務「${subtask.name}」\nid: ${subtask.id}`);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
-  "focustodo_get_today_focus",
-  "查詢今日的專注時間和番茄鐘記錄",
-  {},
-  async () => {
-    try {
-      const data = await api.getTodayFocus();
-      let text = `📊 今日專注記錄\n\n`;
-      text += `總專注時間: ${formatSeconds(data.focusTime)}\n`;
-      text += `完成番茄鐘: ${data.pomodoros} 個\n\n`;
-
-      if (data.tasks.length > 0) {
-        text += `任務明細:\n`;
-        for (const t of data.tasks) {
-          text += `  🍅 ${t.name} - ${formatSeconds(t.focusTime)} (${t.pomodoros} 個番茄)\n`;
-        }
-      } else {
-        text += `今天還沒有專注記錄。`;
-      }
-
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
-    }
-  }
-);
-
-server.tool(
-  "focustodo_get_stats",
-  "查詢專注統計（可按時間範圍和清單篩選）",
+  "focustodo_update_subtask",
+  "修改子任務：改名、標記完成、刪除。子任務 ID 從 focustodo_get_task_detail 取得。",
   {
-    period: z.enum(["today", "this_week", "this_month", "all"]).optional().default("all").describe("時間範圍"),
-    projectName: z.string().optional().describe("清單名稱（如 'Blog'）"),
+    subtaskId: z.string().describe("子任務 ID"),
+    name: z.string().optional().describe("新名稱"),
+    isFinished: z.boolean().optional().describe("true=完成, false=取消完成"),
+    isDeleted: z.boolean().optional().describe("true=刪除"),
+  },
+  async ({ subtaskId, ...updates }) => {
+    try {
+      const clean = Object.fromEntries(Object.entries(updates).filter(([, v]) => v !== undefined));
+      if (!Object.keys(clean).length) return text("❌ 沒有指定任何要修改的欄位");
+      const sub = await api.updateSubtask(subtaskId, clean);
+      if (!sub) return text(`找不到子任務 ${subtaskId}`);
+      const what = sub.isDeleted ? "已刪除" : sub.isFinished ? "已完成" : "已更新";
+      return text(`✅ 子任務「${sub.name}」${what}`);
+    } catch (error) {
+      return text(errorText(error));
+    }
+  }
+);
+
+server.tool(
+  "focustodo_create_project",
+  "建立新清單或新標籤。建立前請確認使用者真的要新增分類 —— 大部分情況應該用既有清單。",
+  {
+    name: z.string().describe("清單名稱"),
+    isTag: z.boolean().optional().default(false).describe("true = 建立標籤（type 3000），false = 建立一般清單"),
+    color: z.string().optional().describe("顏色 hex（如 '#4A90D9'）"),
   },
   async (params) => {
     try {
-      let startDate: number | undefined;
-      const now = new Date();
-
-      switch (params.period) {
-        case "today": {
-          const today = new Date(now);
-          today.setHours(0, 0, 0, 0);
-          startDate = today.getTime();
-          break;
-        }
-        case "this_week": {
-          const weekStart = new Date(now);
-          weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-          weekStart.setHours(0, 0, 0, 0);
-          startDate = weekStart.getTime();
-          break;
-        }
-        case "this_month": {
-          const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-          startDate = monthStart.getTime();
-          break;
-        }
-      }
-
-      const stats = await api.getStats({
-        startDate,
-        projectName: params.projectName,
-      });
-
-      let text = `📊 專注統計\n\n`;
-      text += `總專注時間: ${formatSeconds(stats.totalFocusTime)}\n`;
-      text += `番茄鐘數: ${stats.totalPomodoros} 個\n`;
-      text += `已完成任務: ${stats.completedTasks} 個\n`;
-      text += `待完成任務: ${stats.pendingTasks} 個\n`;
-
-      if (stats.projectBreakdown.length > 0) {
-        text += `\n📁 清單時間分佈:\n`;
-        for (const p of stats.projectBreakdown.slice(0, 10)) {
-          text += `  ${p.name}: ${formatSeconds(p.focusTime)} (${p.pomodoros} 個番茄)\n`;
-        }
-      }
-
-      return { content: [{ type: "text", text }] };
+      const p = await api.createProject(params);
+      return text(`✅ 已建立${params.isTag ? "標籤" : "清單"}「${p.name}」\nid: ${p.id}`);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );
 
 server.tool(
-  "focustodo_search_tasks",
-  "用關鍵字搜尋任務名稱和備註。注意：如果要列出某個清單或標籤的所有任務，請改用 focustodo_list_tasks",
-  {
-    query: z.string().describe("搜尋關鍵字"),
-    limit: z.number().optional().default(10).describe("最多顯示幾筆"),
-  },
-  async ({ query, limit }) => {
+  "focustodo_refresh",
+  "強制重新從 server 拉取最新資料。快取預設 60 秒自動更新，只有在剛用 App 改完東西、要立刻看到結果時才需要手動呼叫。",
+  {},
+  async () => {
     try {
-      const tasks = await api.getTasks();
-      const queryLC = query.toLowerCase();
-      const matched = tasks
-        .filter((t: EnrichedTask) =>
-          t.name.toLowerCase().includes(queryLC) ||
-          t.tagNames?.toLowerCase().includes(queryLC) ||
-          t.remark?.toLowerCase().includes(queryLC)
-        )
-        .slice(0, limit);
-
-      const lines = matched.map((t: EnrichedTask) => {
-        const status = t.isFinished ? "✅" : "⬜";
-        const proj = t.projectName ? ` | ${t.projectName}` : "";
-        return `${status} ${t.name}${proj}\n   id: ${t.id}`;
-      });
-
-      return {
-        content: [{
-          type: "text",
-          text: `搜尋「${query}」找到 ${matched.length} 個任務：\n\n${lines.join("\n\n")}`,
-        }],
-      };
+      await api.refresh();
+      const projects = await api.getProjects();
+      const tasks = await api.getTasks({ isFinished: false });
+      return text(`✅ 已同步：${projects.length} 個清單、${tasks.length} 個未完成任務`);
     } catch (error) {
-      return { content: [{ type: "text", text: errorText(error) }] };
+      return text(errorText(error));
     }
   }
 );

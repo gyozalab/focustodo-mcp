@@ -2,56 +2,49 @@
 
 MCP (Model Context Protocol) Server for [Focus To-Do (專注清單)](https://www.focustodo.cn/) — a Pomodoro timer + task management app.
 
-This server enables AI assistants (Claude Code, Claude Desktop, etc.) to read and write your Focus To-Do tasks, query focus statistics, and manage your Pomodoro workflow via natural language.
+讓 AI 助理（Claude Code、Claude Desktop）用自然語言讀寫你的 Focus To-Do 任務、補記番茄鐘、查專注統計。
 
-> **Note:** This project uses reverse-engineered APIs from Focus To-Do. It is not affiliated with or endorsed by Focus To-Do.
+> 本專案使用逆向工程取得的 Focus To-Do API，與官方無關聯。
 
-## Features
+## Tools (v2.0.0)
 
-| Tool | Description |
-|------|-------------|
-| `focustodo_list_projects` | List all projects and tag-based lists |
-| `focustodo_list_tasks` | List tasks with filters (project, tag, priority, status) |
-| `focustodo_search_tasks` | Search tasks by keyword |
-| `focustodo_get_task_detail` | View task details including subtasks and pomodoro history |
-| `focustodo_create_task` | Create a new task |
-| `focustodo_update_task` | Update task properties |
-| `focustodo_complete_task` | Mark a task as completed |
-| `focustodo_delete_task` | Delete a task |
-| `focustodo_create_subtask` | Add a subtask |
-| `focustodo_get_today_focus` | Get today's focus time and sessions |
-| `focustodo_get_stats` | Get focus statistics (by period and project) |
+### 查詢
+
+| Tool | 說明 |
+|------|------|
+| `focustodo_list_projects` | 列出所有清單與標籤 |
+| `focustodo_list_tasks` | 列任務，可依清單/標籤/優先級/完成狀態/到期日篩選 |
+| `focustodo_search_tasks` | 關鍵字搜尋名稱、標籤、備註 |
+| `focustodo_get_task_detail` | 單一任務詳情（含子任務與番茄鐘記錄） |
+| `focustodo_get_today_focus` | 今日總覽：已專注時間 + 今天到期 + 逾期未完成 |
+| `focustodo_get_stats` | 專注統計，含清單分佈與每日長條圖 |
+| `focustodo_refresh` | 強制重新同步（快取預設 60 秒自動更新） |
+
+### 寫入
+
+| Tool | 說明 |
+|------|------|
+| `focustodo_create_task` | 建任務，支援 `tasks` 陣列批次建立 |
+| `focustodo_update_task` | 改名稱/優先級/到期日/標籤/所屬清單/備註 |
+| `focustodo_complete_task` | 標記完成，支援 `taskIds` 批次，`uncomplete` 可反向 |
+| `focustodo_delete_task` | 軟刪除，支援 `taskIds` 批次 |
+| `focustodo_log_pomodoro` | 補記已完成的專注時段，同步累加任務番茄計數 |
+| `focustodo_create_subtask` | 新增子任務（自動標記父任務 `hasSubtask`） |
+| `focustodo_update_subtask` | 子任務改名 / 完成 / 刪除 |
+| `focustodo_create_project` | 建立新清單或新標籤 |
+
+所有寫入操作完成後會用獨立 clientId 跑 delta sync 向 server 驗證，回 ✅ 代表 server 真的持久化了。
 
 ## Setup
 
-### 1. Install dependencies
-
 ```bash
 npm install
-```
-
-### 2. Configure credentials
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your Focus To-Do account credentials:
-
-```
-FOCUSTODO_ACCOUNT=your-email@example.com
-FOCUSTODO_PASSWORD=your-password
-```
-
-### 3. Build
-
-```bash
+cp .env.example .env    # 填入 FOCUSTODO_ACCOUNT / FOCUSTODO_PASSWORD
 npm run build
+npm run selftest        # 驗證：純函式斷言 + 對真實 server 的建→改→刪循環
 ```
 
-### 4. Configure MCP
-
-Add to your Claude Code `.mcp.json` or Claude Desktop config:
+MCP 設定（Claude Code `.mcp.json` 或 Claude Desktop config）：
 
 ```json
 {
@@ -68,47 +61,39 @@ Add to your Claude Code `.mcp.json` or Claude Desktop config:
 }
 ```
 
+設 `PORT` 環境變數則改跑 HTTP 模式（`/health` + `/mcp`），供 Zeabur 之類的平台部署後給 Claude.ai 連接。
+
 ## Usage Examples
 
-Once configured, you can ask your AI assistant:
-
-- "列出我的 Blog 清單任務"
-- "幫我加一個任務到書寫 Output：寫 AI 工具評測文章，3 顆番茄"
-- "這週我花最多時間在哪個清單？"
-- "今天我專注了多久？"
+- 「列出我的 Blog 清單任務」
+- 「今天做什麼」→ 今日專注 + 到期 + 逾期一次給
+- 「這週我花最多時間在哪個清單？」
+- 「把這五件事加到書寫 Output」→ 一次呼叫批次建立
+- 「剛剛專注了 45 分鐘在寫文章那個任務，幫我補記」
 
 ## Technical Notes
 
 - **API Base**: `https://app.hk1.focustodo.net/`
-- **Auth**: Email + password login → cookie-based session
-- **Sync**: Full bidirectional sync via `POST /v64/sync`
-- **Data Model**:
-  - `type=1000` → Regular project/list
-  - `type=3000` → Tag-based virtual list (tasks reference these via the `tags` field using project IDs)
-- **Auto re-login**: Session expiry triggers automatic re-authentication
+- **Auth**: Email + password → cookie session，過期自動重登
+- **Sync**: 雙向全量同步 `POST /v64/sync`；`timestamp` 是 epoch ms，帶入即取該時點後的 delta
+- **Data model**
+  - `type=1000` → 一般清單
+  - `type=3000` → 標籤（任務的 `tags` 欄位存的是這些清單的 **ID**，不是文字。本 server 自動做名稱↔ID 轉換）
+  - `state`：`0` = 正常，`-1` = 已刪除
+  - `deadline`：當地時區當天 23:59:59.999。傳 `'2026-08-05'` 會正確轉換
+- **快取**：60 秒 TTL，過期自動拉 delta。避免常駐的 MCP process 一直回傳啟動時的舊資料
 
-## ⚠️ Known Limitations (v1.2.1)
+### 收件匣與孤兒卡
 
-**Server-side anti-tampering for existing tasks**
+沒指定清單的任務會落在收件匣（magic id `id-task-tasks`），App 看得到。
 
-FocusTodo's `/v64/sync` server silently rejects modifications to existing task IDs from non-official clients (chrome extension / mobile app are the only authorized writers — they include an undisclosed signature). Confirmed via:
-- MCP `update_task` / `complete_task` / `delete_task` → server returns `status=0` but never persists
-- Direct `POST` bypassing MCP, with `client="chrome-extension"` → still rejected
-- INSERT (new task IDs) is the only write path that works
+⚠️ 若 `projectId` 是**空字串**會變成「真孤兒」：server 上存在，但 App 任何視圖（清單、搜尋、收件匣）都不顯示，使用者無法操作。v2.0.0 起 `create_task` 一律 fallback 到收件匣，不會再產生孤兒；`list_tasks` / `search_tasks` 預設濾掉歷史殘留的孤兒卡（`includeOrphans: true` 才看得到）。
 
-**v1.2.0 mitigation**: All `update_task` / `complete_task` / `delete_task` calls now do a post-write delta sync to verify the server actually applied the change. If verification fails, the tool throws an error explaining the limitation. This eliminates the "false success" problem where Claude reports `✅ deleted` but nothing changes server-side.
+### 關於「無法修改既有任務」
 
-**Workaround for users**: When you see the verification error, perform the modification directly in the FocusTodo App (search-and-swipe-delete, or check/edit in-app).
+v1.2.x 的 README 曾記載 server 對既有任務有 anti-tampering 鎖、MCP 只能讀與新建。**2026-08-02 實測已推翻**：4 種 client/timestamp 組合下的 update、complete、delete 全部寫入並持久化，番茄鐘與清單的建立、刪除同樣生效。
 
-**Future work (out of scope for v1.2.1)**: Reverse-engineer the chrome-extension signature scheme via mitmproxy capture. Until then, MCP is read-and-create-only for existing tasks.
-
-### Orphan tasks (projectId = empty string)
-
-Tasks created without a `projectId` (legacy MCP create_task missing `projectName`) become "true orphans" — they exist on the server but the FocusTodo App's UI does NOT surface them in any view (lists, search, inbox all skip them). Combined with the anti-tampering lock, these tasks cannot be deleted by the user.
-
-Note: `projectId = "id-task-tasks"` is the special **Inbox** project — these ARE visible in the App and not orphans.
-
-**v1.2.1 mitigation**: `list_tasks` and `search_tasks` filter out orphans by default. Pass `includeOrphans: true` to surface them (debugging only). `get_task_detail` always returns orphans when queried by exact ID. This prevents zombies from polluting daily task lists.
+寫入驗證機制（v1.2.0 引入）予以保留 —— 寫入成功與否不該靠猜。
 
 ## License
 
