@@ -30,11 +30,40 @@ const CACHE_TTL_MS = 60_000;
 const STATE_ACTIVE = 0;
 const STATE_DELETED = -1;
 
+/** project.type：1000=一般清單、3000=標籤 */
+const TYPE_LIST = 1000;
+export const TYPE_TAG = 3000;
+
+/**
+ * 其餘 type（實測有 4001 PRJ_TOMORROW、4004 PRJ_DEADLINE_LAST7DAYS、
+ * 4006 PRJ_DEADLINE_OVERDUE、5003 PRJ_PRIORITY_HIGH）是 App 內建的智慧清單
+ * ——動態篩選視圖，不是容器。實測沒有任何任務歸屬其中。
+ *
+ * 一定要濾掉：留著的話 list_projects 會把它們當成可用清單報給 LLM，
+ * 而 mustFindProject 一旦模糊命中，任務就會被建到 id-priority-high 之類的
+ * 假清單裡，變成 App 看不到的另一種孤兒。
+ */
+function isRealProject(p: Project): boolean {
+  return p.type === TYPE_LIST || p.type === TYPE_TAG;
+}
+
 /** 寫入後多久去確認。實測 server 的可見延遲約 400ms，600ms 起跳留了裕度。 */
 const VERIFY_BASE_DELAY_MS = 600;
 /** 看不到就退避重試（600ms → 1.8s → 5.4s，累計約 7.8 秒才放棄）。 */
 const VERIFY_ATTEMPTS = 3;
 const VERIFY_TOTAL_WAIT_LABEL = "約 8 秒";
+
+/**
+ * 已知邊界（Codex review 2026-08-02 指出）：一次寫入最多含 5 趟 HTTP
+ * （freshData 1 + sync 1 + verify 3）加 7.8 秒退避，而每趟允許 FETCH_TIMEOUT_MS。
+ * 所以總時間沒有收斂在 MCP client 預設的 60 秒逾時內——server 若持續慢到
+ * 每趟 11 秒以上，client 會先逾時，而寫入其實還在背景進行並可能成功。
+ *
+ * 刻意不修：要壓進 60 秒得砍重試輪數或退避，而那個裕度有 2026-04-29 的事故
+ * 撐腰（見 verifyApplied）。正常路徑實測約 1 秒，離上限很遠；真的變慢會先被
+ * selftest 的「寫入可見延遲」校準項（3 秒門檻）抓到。要真正收斂得把單一
+ * deadline 一路傳進每趟 fetch，等有實例再做。
+ */
 
 /** fetch with AbortController timeout */
 async function fetchWithTimeout(
@@ -46,8 +75,26 @@ async function fetchWithTimeout(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      throw new Error(`連線逾時（${timeoutMs / 1000} 秒）：${url}`);
+    }
+    throw e;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** 讀 JSON 並先檢查 HTTP 狀態。少了這層，server 回 502 HTML 時
+ *  錯誤訊息會是看不懂的 `Unexpected token '<'`。 */
+async function readJson<T>(res: Response, what: string): Promise<T> {
+  if (!res.ok) {
+    throw new Error(`${what} 失敗：HTTP ${res.status} ${res.statusText}`);
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new Error(`${what} 回應不是合法 JSON（HTTP ${res.status}）`);
   }
 }
 
@@ -98,7 +145,7 @@ export class FocusToDoAPI {
       body: body.toString(),
     });
 
-    const data = (await res.json()) as LoginResponse;
+    const data = await readJson<LoginResponse>(res, "登入");
     if (data.status !== 0) {
       throw new Error(`Login failed: status=${data.status}`);
     }
@@ -123,26 +170,30 @@ export class FocusToDoAPI {
     return this.creds!;
   }
 
-  /** 完整同步（拉取+推送）*/
-  async sync(
-    payload?: {
-      projects?: Partial<Project>[];
-      tasks?: Partial<Task>[];
-      subtasks?: Partial<Subtask>[];
-      pomodoros?: Partial<Pomodoro>[];
+  /** POST /v64/sync 的共用管線。sync 與 fetchDelta 只差 timestamp/clientId 和要不要帶 payload。 */
+  private async postSync(
+    opts: {
+      timestamp: number;
+      clientId: string;
+      payload?: {
+        projects?: Partial<Project>[];
+        tasks?: Partial<Task>[];
+        subtasks?: Partial<Subtask>[];
+        pomodoros?: Partial<Pomodoro>[];
+      };
     },
-    _retryCount = 0
+    what: string
   ): Promise<SyncResponse> {
     const creds = await this.ensureAuth();
-
+    const p = opts.payload;
     const body = new URLSearchParams({
-      timestamp: String(this.syncTimestamp),
-      clientId: this.clientId,
+      timestamp: String(opts.timestamp),
+      clientId: opts.clientId,
       client: CLIENT_NAME,
-      projects: JSON.stringify(payload?.projects || []),
-      tasks: JSON.stringify(payload?.tasks || []),
-      subtasks: JSON.stringify(payload?.subtasks || []),
-      pomodoros: JSON.stringify(payload?.pomodoros || []),
+      projects: JSON.stringify(p?.projects || []),
+      tasks: JSON.stringify(p?.tasks || []),
+      subtasks: JSON.stringify(p?.subtasks || []),
+      pomodoros: JSON.stringify(p?.pomodoros || []),
       schedules: "[]",
       acct: creds.acct,
       name: creds.name,
@@ -158,8 +209,32 @@ export class FocusToDoAPI {
       },
       body: body.toString(),
     });
+    const data = await readJson<SyncResponse>(res, what);
 
-    const data = (await res.json()) as SyncResponse;
+    // Session cookie 輪替。放這裡而非 sync()，否則 fetchDelta 收到新 jsessionId
+    // 也不會採用，下一輪驗證還在用舊 cookie。
+    if (data.jsessionId && this.creds) {
+      const parts = this.creds.cookies.split("; ").filter((c) => !c.startsWith("JSESSIONID="));
+      parts.push(`JSESSIONID=${data.jsessionId}`);
+      this.creds.cookies = parts.join("; ");
+    }
+    return data;
+  }
+
+  /** 完整同步（拉取+推送）*/
+  async sync(
+    payload?: {
+      projects?: Partial<Project>[];
+      tasks?: Partial<Task>[];
+      subtasks?: Partial<Subtask>[];
+      pomodoros?: Partial<Pomodoro>[];
+    },
+    _retryCount = 0
+  ): Promise<SyncResponse> {
+    const data = await this.postSync(
+      { timestamp: this.syncTimestamp, clientId: this.clientId, payload },
+      "同步"
+    );
 
     if (data.status !== 0) {
       // Session expired — re-login and retry (with limit to prevent infinite loop)
@@ -169,14 +244,9 @@ export class FocusToDoAPI {
         await new Promise((r) => setTimeout(r, backoffMs));
         return this.sync(payload, _retryCount + 1);
       }
-      throw new Error(`Sync failed: status=${data.status} (after ${_retryCount} retries)`);
-    }
-
-    // Update session cookie if returned
-    if (data.jsessionId) {
-      const parts = creds.cookies.split("; ").filter((p) => !p.startsWith("JSESSIONID="));
-      parts.push(`JSESSIONID=${data.jsessionId}`);
-      creds.cookies = parts.join("; ");
+      // status 語義（實測）：-1/-2=session 失效（上面已重試）、-9=送出的資料被拒收
+      const hint = data.status === -9 ? "（-9：資料格式被 server 拒收，例如送了不完整的物件）" : "";
+      throw new Error(`Sync failed: status=${data.status}${hint} (after ${_retryCount} retries)`);
     }
 
     // Merge data into cache
@@ -240,6 +310,28 @@ export class FocusToDoAPI {
     await this.ensureData();
   }
 
+  /**
+   * 讀-改-寫路徑專用：先把快取拉到最新再動手。
+   *
+   * server 的 sync 只收完整物件，所以 `{...task, ...patch}` 會把快取裡每一個
+   * 欄位都寫回去。用最多 60 秒舊的快取當底，等於把使用者這段期間在 App 改的
+   * remark／deadline 全部回捲。多一次 delta 換掉這個資料遺失。
+   *
+   * 2026-08-02 實測過「只送變更欄位」這條路：送 `{id, name}` 的 partial task，
+   * server 回 `status=-9` 整批拒收（好消息是拒絕為原子的，不留半套狀態）。
+   * 所以整物件覆蓋是 server 強制的，不是這裡偷懶——freshData 只能把競態視窗
+   * 從 60 秒縮到一次往返，消不掉。真要消除得靠 server 端的樂觀鎖，而它沒有。
+   */
+  private async freshData(): Promise<void> {
+    await this.refresh();
+  }
+
+  /** projectId → 顯示名稱。收件匣不是真 project，server 的 projects 裡查不到。 */
+  private projectNameOf(projectId: string): string | undefined {
+    if (projectId === INBOX_PROJECT_ID) return "收件匣";
+    return this._projects.find((p) => p.id === projectId)?.name;
+  }
+
   // ===== 清單／標籤解析 =====
 
   /** 依名稱模糊找清單（優先完全相符，其次包含）。收件匣不是真 project，特別處理。 */
@@ -251,7 +343,7 @@ export class FocusToDoAPI {
         isDefault: true, isDeleted: false, state: STATE_ACTIVE, parentId: "", creationDate: 0,
       };
     }
-    const alive = this._projects.filter((p) => !p.isDeleted);
+    const alive = this._projects.filter((p) => !p.isDeleted && isRealProject(p));
     return (
       alive.find((p) => p.name.toLowerCase() === lc) ||
       alive.find((p) => p.name.toLowerCase().includes(lc))
@@ -262,7 +354,9 @@ export class FocusToDoAPI {
   private mustFindProject(name: string): Project {
     const found = this.findProject(name);
     if (found) return found;
-    const available = this._projects.filter((p) => !p.isDeleted).map((p) => (p.type === 3000 ? `#${p.name}` : p.name));
+    const available = this._projects
+      .filter((p) => !p.isDeleted && isRealProject(p))
+      .map((p) => (p.type === TYPE_TAG ? `#${p.name}` : p.name));
     throw new Error(`找不到清單「${name}」。現有清單：收件匣、${available.join("、")}`);
   }
 
@@ -276,15 +370,16 @@ export class FocusToDoAPI {
     const ids: string[] = [];
     const unknown: string[] = [];
     for (const part of parts) {
-      const byId = this._projects.find((p) => p.id === part);
+      // 只認標籤的 ID。傳一般清單的 ID 會寫進去一個 App 解讀不了的 tags 值
+      const byId = this._projects.find((p) => p.id === part && p.type === TYPE_TAG);
       if (byId) {
         ids.push(byId.id);
         continue;
       }
       const tag = this._projects.find(
-        (p) => p.type === 3000 && !p.isDeleted && p.name.toLowerCase() === part.toLowerCase()
+        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase() === part.toLowerCase()
       ) || this._projects.find(
-        (p) => p.type === 3000 && !p.isDeleted && p.name.toLowerCase().includes(part.toLowerCase())
+        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase().includes(part.toLowerCase())
       );
       if (tag) ids.push(tag.id);
       else unknown.push(part);
@@ -302,7 +397,7 @@ export class FocusToDoAPI {
 
   async getProjects(): Promise<Project[]> {
     await this.ensureData();
-    return this._projects.filter((p) => !p.isDeleted);
+    return this._projects.filter((p) => !p.isDeleted && isRealProject(p));
   }
 
   async getTasks(filters?: {
@@ -311,7 +406,6 @@ export class FocusToDoAPI {
     tag?: string;
     priority?: number;
     isFinished?: boolean;
-    includeDeleted?: boolean;
     /** 到期日篩選：overdue=已逾期未完成、today=今天到期、week=未來七天內到期 */
     due?: "overdue" | "today" | "week";
     /** 預設 false：隱藏 projectId="" 的「真孤兒」（user 在 App 看不到、也刪不掉）。 */
@@ -319,7 +413,7 @@ export class FocusToDoAPI {
   }): Promise<EnrichedTask[]> {
     await this.ensureData();
 
-    let tasks = this._tasks.filter((t) => (!filters?.includeDeleted ? !t.isDeleted : true));
+    let tasks = this._tasks.filter((t) => !t.isDeleted);
 
     // ⬇️ 預設過濾真孤兒（projectId=""），保留 Inbox magic 字串 "id-task-tasks"
     if (!filters?.includeOrphans) {
@@ -332,7 +426,7 @@ export class FocusToDoAPI {
     if (filters?.projectName) {
       // 找不到要明說。靜默回空陣列會讓使用者以為清單是空的，而不是名字打錯了。
       const project = this.mustFindProject(filters.projectName);
-      if (project.type === 3000) {
+      if (project.type === TYPE_TAG) {
         // 標籤型清單（Blog、iPAS 等）：tags 欄位存的是 project ID
         tasks = tasks.filter((t) => t.tags.includes(project.id));
       } else if (project.id === INBOX_PROJECT_ID) {
@@ -344,12 +438,12 @@ export class FocusToDoAPI {
     if (filters?.tag) {
       const wanted = filters.tag.toLowerCase().replace(/^#/, "");
       const tagProject = this._projects.find(
-        (p) => p.type === 3000 && !p.isDeleted && p.name.toLowerCase() === wanted
+        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase() === wanted
       ) || this._projects.find(
-        (p) => p.type === 3000 && !p.isDeleted && p.name.toLowerCase().includes(wanted)
+        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase().includes(wanted)
       );
       if (!tagProject) {
-        const available = this._projects.filter((p) => p.type === 3000 && !p.isDeleted).map((p) => p.name);
+        const available = this._projects.filter((p) => p.type === TYPE_TAG && !p.isDeleted).map((p) => p.name);
         throw new Error(`找不到標籤「${filters.tag}」。現有標籤：${available.join("、") || "（無）"}`);
       }
       tasks = tasks.filter((t) => t.tags.includes(tagProject.id));
@@ -385,13 +479,7 @@ export class FocusToDoAPI {
           .filter(Boolean)
           .join(" ")
       : "";
-    // 收件匣不是真的 project，server 不會在 projects 裡回傳它。
-    // 沒有這行的話，落在收件匣的任務（本帳號有 183 筆）全都顯示不出歸屬。
-    const projectName =
-      t.projectId === INBOX_PROJECT_ID
-        ? "收件匣"
-        : this._projects.find((p) => p.id === t.projectId)?.name;
-    return { ...t, projectName, tagNames };
+    return { ...t, projectName: this.projectNameOf(t.projectId), tagNames };
   }
 
   /** 新任務排在最前面。FocusTodo 的 order 越小越前，固定給 0 會插進清單中段。 */
@@ -411,26 +499,10 @@ export class FocusToDoAPI {
     return this._subtasks.filter((s) => s.taskId === taskId && !s.isDeleted);
   }
 
-  async getPomodoros(filters?: {
-    taskId?: string;
-    startDate?: number;
-    endDate?: number;
-  }): Promise<Pomodoro[]> {
+  async getPomodoros(filters?: { taskId?: string }): Promise<Pomodoro[]> {
     await this.ensureData();
-
-    let pomos = this._pomodoros.filter((p) => p.state !== STATE_DELETED);
-
-    if (filters?.taskId) {
-      pomos = pomos.filter((p) => p.taskId === filters.taskId);
-    }
-    if (filters?.startDate) {
-      pomos = pomos.filter((p) => p.endDate >= filters.startDate!);
-    }
-    if (filters?.endDate) {
-      pomos = pomos.filter((p) => p.endDate <= filters.endDate!);
-    }
-
-    return pomos;
+    const pomos = this._pomodoros.filter((p) => p.state !== STATE_DELETED);
+    return filters?.taskId ? pomos.filter((p) => p.taskId === filters.taskId) : pomos;
   }
 
   // ===== 寫入 API =====
@@ -509,18 +581,13 @@ export class FocusToDoAPI {
     return built;
   }
 
-  async createTask(params: Parameters<FocusToDoAPI["createTasks"]>[0][0]): Promise<Task> {
-    const [task] = await this.createTasks([params]);
-    return task;
-  }
-
   /** 把使用者給的 patch 正規化成 server 欄位（解析清單名稱、標籤名稱） */
   private normalizePatch(updates: TaskPatch): Record<string, unknown> {
     const { projectName, ...fields } = updates;
     const patch: Record<string, unknown> = { ...fields };
     if (projectName !== undefined) {
       const project = this.mustFindProject(projectName);
-      if (project.type === 3000) {
+      if (project.type === TYPE_TAG) {
         throw new Error(`「${projectName}」是標籤不是清單，請改用 tags 參數`);
       }
       patch.projectId = project.id;
@@ -541,7 +608,7 @@ export class FocusToDoAPI {
     taskIds: string[],
     updates: TaskPatch | ((task: Task) => TaskPatch)
   ): Promise<{ updated: Task[]; failed: { id: string; reason: string }[] }> {
-    await this.ensureData();
+    await this.freshData();
 
     const failed: { id: string; reason: string }[] = [];
     const staged: { task: Task; patch: Record<string, unknown> }[] = [];
@@ -609,18 +676,6 @@ export class FocusToDoAPI {
     return this.updateTasks(taskIds, { isDeleted: true, state: STATE_DELETED });
   }
 
-  async completeTask(taskId: string): Promise<Task | null> {
-    return this.updateTask(taskId, { isFinished: true, finishedDate: Date.now() });
-  }
-
-  async uncompleteTask(taskId: string): Promise<Task | null> {
-    return this.updateTask(taskId, { isFinished: false, finishedDate: 0 });
-  }
-
-  async deleteTask(taskId: string): Promise<Task | null> {
-    return this.updateTask(taskId, { isDeleted: true, state: STATE_DELETED });
-  }
-
   /**
    * 拉 delta，讀 server 的真實持久層狀態。
    *
@@ -632,31 +687,21 @@ export class FocusToDoAPI {
    * 四種組合都看得到自己剛 push 的變動，server 不做這層過濾。這裡仍用新
    * clientId，因為沒有理由讓驗證讀取去動到 this.clientId 的同步游標。
    */
-  private async fetchDelta(sinceMs: number): Promise<SyncResponse> {
-    const creds = await this.ensureAuth();
-    const body = new URLSearchParams({
-      timestamp: String(sinceMs),
-      clientId: randomUUID(),
-      client: CLIENT_NAME,
-      projects: "[]",
-      tasks: "[]",
-      subtasks: "[]",
-      pomodoros: "[]",
-      schedules: "[]",
-      acct: creds.acct,
-      name: creds.name,
-      pid: creds.pid,
-      uid: creds.uid,
-    });
-    const res = await fetchWithTimeout(`${BASE_URL}/v64/sync`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        Cookie: creds.cookies,
-      },
-      body: body.toString(),
-    });
-    return (await res.json()) as SyncResponse;
+  private async fetchDelta(sinceMs: number, _retry = true): Promise<SyncResponse> {
+    const data = await this.postSync({ timestamp: sinceMs, clientId: randomUUID() }, "驗證同步");
+    if (data.status === 0) return data;
+
+    // ⚠️ 不檢查 status 的話會重演 2026-04-29：session 過期時 server 回
+    // status=-1 且不帶 tasks，呼叫端的 `data[kind] || []` 把它讀成「空的 delta」，
+    // 於是「還沒看到」被當成「寫入沒生效」——而寫入其實已經持久化了。
+    if ((data.status === -1 || data.status === -2) && _retry) {
+      this.creds = null; // 重登後再讀一次
+      return this.fetchDelta(sinceMs, false);
+    }
+    // 讀不到就要說「讀不到」，不能讓它偽裝成一份空的 delta 往下流
+    throw new Error(
+      `驗證讀取失敗（status=${data.status}）。寫入很可能已生效，只是無法確認——請重新查詢，不要重複送出。`
+    );
   }
 
   /**
@@ -672,6 +717,9 @@ export class FocusToDoAPI {
    *
    * 「還沒看到」不等於「被拒絕」。看不到就退避重試，重試完仍看不到也只能
    * 說「無法確認」，不能宣稱 server 拒絕。
+   *
+   * 同理，「看到舊值」也不等於「被拒絕」——delta 窗口撈到的可能是這筆記錄
+   * 寫入前的版本。所以欄位不符也要重試，只有最後一輪仍不符才定讞。
    */
   private async verifyApplied(
     kind: "tasks" | "subtasks" | "pomodoros" | "projects",
@@ -689,6 +737,8 @@ export class FocusToDoAPI {
       const data = await this.fetchDelta(pushedAt - 5000);
       const rows = (data[kind] || []) as { id: string }[];
       const stillPending: typeof pending = [];
+      // 只有最後一輪的比對結果算數：前幾輪的不符很可能是還沒寫完的舊值
+      mismatched.clear();
 
       for (const item of pending) {
         const echoed = rows.find((r) => r.id === item.id);
@@ -703,25 +753,25 @@ export class FocusToDoAPI {
             mismatches.push(`${key}: 期望=${JSON.stringify(expected)} 實際=${JSON.stringify(actual)}`);
           }
         }
-        // 欄位不符代表 server 真的存了別的值，這是確定的失敗，不必再重試
-        if (mismatches.length) mismatched.set(item.id, mismatches.join("; "));
+        if (mismatches.length) {
+          mismatched.set(item.id, mismatches.join("; "));
+          stillPending.push(item); // 可能只是舊值，下一輪再確認
+        }
       }
       pending = stillPending;
     }
 
-    return [
-      ...pending.map((p) => ({
+    return pending.map((p) => {
+      const reason = mismatched.get(p.id);
+      return {
         id: p.id,
-        reason:
-          `無法確認 server 是否已套用（等待 ${VERIFY_TOTAL_WAIT_LABEL} 仍未在同步資料中出現）。` +
-          `這通常是 server 寫入延遲，不代表被拒絕——變更很可能稍後就會生效。` +
-          `請重新查詢確認，不要重複送出。`,
-      })),
-      ...[...mismatched].map(([id, reason]) => ({
-        id,
-        reason: `Server 存的值與送出的不符：${reason}`,
-      })),
-    ];
+        reason: reason
+          ? `Server 存的值與送出的不符（重試 ${VERIFY_ATTEMPTS} 次後仍不符）：${reason}`
+          : `無法確認 server 是否已套用（等待 ${VERIFY_TOTAL_WAIT_LABEL} 仍未在同步資料中出現）。` +
+            `這通常是 server 寫入延遲，不代表被拒絕——變更很可能稍後就會生效。` +
+            `請重新查詢確認，不要重複送出。`,
+      };
+    });
   }
 
   /** 驗證單筆寫入，沒過就 throw */
@@ -742,7 +792,7 @@ export class FocusToDoAPI {
     name: string;
     estimatedPomoNum?: number;
   }): Promise<Subtask> {
-    await this.ensureData();
+    await this.freshData(); // 會連帶推送父任務的 hasSubtask，整物件覆蓋
 
     const now = Date.now();
     const subtask: Subtask = {
@@ -776,7 +826,7 @@ export class FocusToDoAPI {
     subtaskId: string,
     updates: Partial<Pick<Subtask, "name" | "isFinished" | "isDeleted" | "estimatedPomoNum">>
   ): Promise<Subtask | null> {
-    await this.ensureData();
+    await this.freshData();
     const sub = this._subtasks.find((s) => s.id === subtaskId);
     if (!sub) return null;
 
@@ -808,7 +858,7 @@ export class FocusToDoAPI {
     endDate?: number;
     subtaskId?: string;
   }): Promise<Pomodoro> {
-    await this.ensureData();
+    await this.freshData(); // actualPomoNum 是讀-改-寫，用舊快取會吃掉 App 端的計數
 
     const task = this._tasks.find((t) => t.id === params.taskId);
     if (!task) throw new Error(`找不到任務 ${params.taskId}`);
@@ -861,8 +911,9 @@ export class FocusToDoAPI {
       id: randomUUID(),
       name: params.name,
       color: params.color || "#4A90D9",
-      type: params.isTag ? 3000 : 1000,
-      order: Math.min(0, ...this._projects.map((p) => p.order)) - 1000,
+      type: params.isTag ? TYPE_TAG : TYPE_LIST,
+      // reduce 而非 spread，理由同 nextTaskOrder
+      order: this._projects.reduce((min, p) => Math.min(min, p.order), 0) - 1000,
       isDefault: false,
       isDeleted: false,
       state: STATE_ACTIVE,
@@ -882,7 +933,6 @@ export class FocusToDoAPI {
 
   async getStats(filters?: {
     startDate?: number;
-    endDate?: number;
     projectName?: string;
   }): Promise<{
     totalFocusTime: number;
@@ -898,12 +948,11 @@ export class FocusToDoAPI {
     let tasks = this._tasks.filter((t) => !t.isDeleted);
 
     if (filters?.startDate) pomos = pomos.filter((p) => p.endDate >= filters.startDate!);
-    if (filters?.endDate) pomos = pomos.filter((p) => p.endDate <= filters.endDate!);
 
     if (filters?.projectName) {
       const project = this.mustFindProject(filters.projectName);
       const inProject =
-        project.type === 3000
+        project.type === TYPE_TAG
           ? tasks.filter((t) => t.tags.includes(project.id))
           : tasks.filter((t) => t.projectId === project.id);
       const taskIds = new Set(inProject.map((t) => t.id));
@@ -912,9 +961,9 @@ export class FocusToDoAPI {
     }
 
     // 完成數只算範圍內完成的，否則 "本週統計" 會混進歷史累計
-    const completedTasks = filters?.startDate
-      ? tasks.filter((t) => t.isFinished && t.finishedDate >= filters.startDate!).length
-      : tasks.filter((t) => t.isFinished).length;
+    const completedTasks = tasks.filter(
+      (t) => t.isFinished && (!filters?.startDate || t.finishedDate >= filters.startDate)
+    ).length;
 
     const projectMap = new Map<string, { focusTime: number; pomodoros: number }>();
     const dailyMap = new Map<string, { focusTime: number; pomodoros: number }>();
@@ -939,10 +988,7 @@ export class FocusToDoAPI {
       completedTasks,
       pendingTasks: tasks.filter((t) => !t.isFinished).length,
       projectBreakdown: Array.from(projectMap.entries())
-        .map(([projId, s]) => ({
-          name: this._projects.find((p) => p.id === projId)?.name || "未分類",
-          ...s,
-        }))
+        .map(([projId, s]) => ({ name: this.projectNameOf(projId) || "未分類", ...s }))
         .sort((a, b) => b.focusTime - a.focusTime),
       dailyBreakdown: Array.from(dailyMap.entries())
         .map(([date, s]) => ({ date, ...s }))

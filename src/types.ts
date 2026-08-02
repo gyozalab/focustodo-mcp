@@ -7,9 +7,6 @@ export interface LoginResponse {
   uid: string;
   pid: string;
   name: string;
-  portrait?: string;
-  expiredDate?: number;
-  avatarTimestamp?: number;
 }
 
 export interface Project {
@@ -77,16 +74,6 @@ export interface Pomodoro {
   isManual: boolean;
 }
 
-export interface Schedule {
-  id: string;
-  taskId: string;
-  subtaskId: string;
-  interval: number;
-  endDate: number;
-  creationDate: number;
-  state: number;
-}
-
 export interface SyncResponse {
   status: number;
   timestamp: number;
@@ -95,7 +82,7 @@ export interface SyncResponse {
   tasks: Task[];
   subtasks: Subtask[];
   pomodoros: Pomodoro[];
-  schedules: Schedule[];
+  // schedules 一律送 "[]" 也從不讀，故不建模
 }
 
 export interface Credentials {

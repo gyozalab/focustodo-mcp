@@ -1,0 +1,15 @@
+# .gitignore 擋得住 git，擋不住 Docker 的 COPY . .
+# .env 含明文帳密，進了映像等於隨映像散佈
+.env
+.env.*
+!.env.example
+
+# Windows 上編譯的原生模組不能用在 Linux 映像，且會覆蓋 npm ci 的結果
+node_modules/
+dist/
+
+.git/
+.gitignore
+*.log
+probe-*.json
+probe-*.txt

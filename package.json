@@ -6,17 +6,19 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "selftest": "tsx src/selftest.ts"
+    "start": "node --env-file-if-exists=.env dist/index.js",
+    "dev": "tsx --env-file=.env src/index.ts",
+    "selftest": "tsx --env-file=.env src/selftest.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "dotenv": "^16.4.7"
+    "@modelcontextprotocol/sdk": "^1.12.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=20.12"
   }
 }

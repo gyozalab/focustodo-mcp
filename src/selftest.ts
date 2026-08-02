@@ -7,8 +7,9 @@
  *
  * 端到端測試會在收件匣建 [MCP自測] 卡，跑完自動刪除。
  */
-import "dotenv/config";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { FocusToDoAPI, parseDeadline, todayBounds, INBOX_PROJECT_ID } from "./api.js";
 
 let failed = 0;
@@ -70,6 +71,24 @@ async function main() {
 
   await check("讀取清單", async () => {
     assert.ok((await api.getProjects()).length > 0, "清單數應大於 0");
+  });
+
+  // App 內建的智慧清單（PRJ_DEADLINE_OVERDUE、PRJ_PRIORITY_HIGH 等，type 4xxx/5xxx）
+  // 是動態篩選視圖不是容器。漏掉這層過濾，任務會被建進 id-priority-high 之類的
+  // 假清單，變成 App 看不到的孤兒。
+  await check("智慧清單不該被當成可寫入的清單", async () => {
+    const projects = await api.getProjects();
+    for (const p of projects) {
+      assert.ok(
+        p.type === 1000 || p.type === 3000,
+        `「${p.name}」type=${p.type} 是智慧清單，不該出現在清單列表`
+      );
+    }
+    await assert.rejects(
+      api.getTasks({ projectName: "PRJ_PRIORITY_HIGH" }),
+      /找不到清單/,
+      "智慧清單的名稱不該解析得到"
+    );
   });
 
   await check("清單名稱打錯要報錯，不能靜默回空清單", async () => {
@@ -196,11 +215,120 @@ async function main() {
     createdIds.length = 0;
   });
 
+  // Codex review 抓到的回歸：驗證讀取拿到 status!=0 時，原本 `data[kind] || []`
+  // 會把它讀成「空的 delta」，於是已生效的寫入被報成失敗——2026-04-29 的同型錯誤。
+  //
+  // 直接注入 postSync 的回應，不靠 server 配合：壞 cookie 模擬不出來，
+  // FocusTodo 認的是 body 裡的 acct/pid/uid，不是 JSESSIONID。
+  await check("驗證讀取拿到 status!=0 要 throw，不能偽裝成空的 delta", async () => {
+    const probe = new FocusToDoAPI(account, password) as unknown as {
+      postSync: (...a: unknown[]) => Promise<unknown>;
+      fetchDelta: (since: number, retry?: boolean) => Promise<{ tasks: unknown[] }>;
+    };
+    const emptyish = { timestamp: 0, projects: [], tasks: [], subtasks: [], pomodoros: [] };
+
+    probe.postSync = async () => ({ status: -1, ...emptyish });
+    await assert.rejects(
+      probe.fetchDelta(Date.now(), false),
+      /驗證讀取失敗/,
+      "session 失效時應 throw，而不是回傳一份沒有 tasks 的空回應"
+    );
+
+    probe.postSync = async () => ({ status: -9, ...emptyish });
+    await assert.rejects(probe.fetchDelta(Date.now(), false), /驗證讀取失敗/, "其他錯誤碼同樣要 throw");
+
+    // status=0 要照常回傳，別把正常路徑也擋掉
+    probe.postSync = async () => ({ status: 0, ...emptyish, tasks: [{ id: "x" }] });
+    assert.equal((await probe.fetchDelta(Date.now(), false)).tasks.length, 1);
+  });
+
+  await checkHttpMode();
+
   console.log(failed ? `\n❌ ${failed} 項失敗` : "\n✅ 全部通過");
   if (createdIds.length) {
     console.log(`⚠️  自測卡殘留 ${createdIds.length} 張，請在 App 收件匣搜尋「[MCP自測]」刪除`);
   }
   process.exit(failed ? 1 : 0);
+}
+
+/**
+ * HTTP 模式的迴歸測試。
+ *
+ * 這裡守的是一個靜態讀 code 看不出來、但會整站掛掉的 bug：舊版每個 /mcp 請求
+ * 都對同一個 McpServer 實例 connect 一個新 transport，SDK 丟
+ * 「Already connected to a transport」，在 async handler 裡變成 unhandled
+ * rejection 直接殺掉 process——第二個請求開始全滅，連 /health 都沒了。
+ *
+ * ⚠️ 關鍵是「送兩次以上」。只測一次請求（或只 curl /health）永遠是綠的，
+ * 當初就是這樣漏掉的。
+ */
+async function checkHttpMode(): Promise<void> {
+  console.log("\n--- HTTP 模式 ---");
+  if (!existsSync("dist/index.js")) {
+    console.log("⚠️  找不到 dist/index.js，請先 npm run build。跳過 HTTP 模式測試");
+    return;
+  }
+
+  const PORT = 8799;
+  const TOKEN = "selftest-token";
+  const child = spawn(process.execPath, ["dist/index.js"], {
+    env: { ...process.env, PORT: String(PORT), MCP_AUTH_TOKEN: TOKEN },
+    stdio: "ignore",
+  });
+
+  const post = async (body: unknown, token = TOKEN) => {
+    const res = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, text: await res.text() };
+  };
+
+  try {
+    // 等 server 起來
+    for (let i = 0; i < 30; i++) {
+      try {
+        if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break;
+      } catch {
+        /* 還沒起來 */
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    await check("/mcp 需要 Bearer token，錯的要 401", async () => {
+      assert.equal((await post({ jsonrpc: "2.0", id: 1, method: "initialize" }, "wrong")).status, 401);
+    });
+
+    await check("連續 3 次請求都要活著（第 2 次曾讓整個 process 死掉）", async () => {
+      for (let i = 1; i <= 3; i++) {
+        const init = await post({
+          jsonrpc: "2.0",
+          id: i,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "selftest", version: "1" } },
+        });
+        assert.equal(init.status, 200, `第 ${i} 次 initialize 應為 200`);
+
+        const list = await post({ jsonrpc: "2.0", id: i, method: "tools/list", params: {} });
+        assert.equal(list.status, 200, `第 ${i} 次 tools/list 應為 200`);
+        assert.ok(
+          list.text.includes("focustodo_list_tasks"),
+          `第 ${i} 次 tools/list 應列得出工具，實際：${list.text.slice(0, 120)}`
+        );
+      }
+    });
+
+    await check("跑完之後 /health 仍然活著", async () => {
+      assert.ok((await fetch(`http://127.0.0.1:${PORT}/health`)).ok);
+    });
+  } finally {
+    child.kill();
+  }
 }
 
 main().catch((e) => {
