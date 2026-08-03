@@ -244,6 +244,7 @@ function buildServer(): McpServer {
           out += `\n最近 5 個番茄鐘:\n`;
           for (const p of pomodoros.sort((a, b) => b.endDate - a.endDate).slice(0, 5)) {
             out += `  🍅 ${formatDate(p.endDate)} - ${formatSeconds(p.interval)}${p.isManual ? "（手動補記）" : ""}\n`;
+            out += `     id: ${p.id}\n`;
           }
         }
         return text(out);
@@ -500,6 +501,31 @@ function buildServer(): McpServer {
           `✅ 已補記 ${formatSeconds(pomo.interval)} 專注到「${task?.name}」\n` +
           `結束時間: ${new Date(pomo.endDate).toLocaleString("zh-TW")}\n` +
           `該任務累計番茄: ${task?.actualPomoNum}`
+        );
+      } catch (error) {
+        return failWith(error);
+      }
+    }
+  );
+
+  server.tool(
+    "focustodo_delete_pomodoro",
+    "刪除番茄鐘記錄（補記錯任務、記錯時間時用），會同時把該任務的番茄計數扣回去。" +
+    "番茄鐘 ID 從 focustodo_get_task_detail 取得。注意：刪任務並不會刪掉它的番茄鐘記錄，" +
+    "那些時間會繼續留在統計裡，要移除得用這個。",
+    {
+      pomodoroId: z.string().optional().describe("番茄鐘 ID（單筆）"),
+      pomodoroIds: z.array(z.string()).optional().describe("番茄鐘 ID 陣列（批次）"),
+    },
+    async ({ pomodoroId, pomodoroIds }) => {
+      try {
+        const ids = pomodoroIds?.length ? pomodoroIds : pomodoroId ? [pomodoroId] : [];
+        if (!ids.length) return fail("❌ 請提供 pomodoroId 或 pomodoroIds");
+        const r = await api.deletePomodoros(ids);
+        if (!r.deleted) return fail("找不到這些番茄鐘記錄（可能已刪除）");
+        return text(
+          `✅ 已刪除 ${r.deleted} 筆番茄鐘（server 已確認）\n` +
+          `從統計中移除 ${formatSeconds(r.focusSeconds)}，任務的番茄計數也已扣回`
         );
       } catch (error) {
         return failWith(error);

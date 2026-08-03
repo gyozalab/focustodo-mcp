@@ -82,6 +82,7 @@ Once configured, just ask your AI assistant:
 | `focustodo_complete_task` | Mark complete (batch supported; `uncomplete` reverses it) |
 | `focustodo_delete_task` | Soft delete (batch supported) |
 | `focustodo_log_pomodoro` | Log a finished focus session and bump the task's pomodoro count |
+| `focustodo_delete_pomodoro` | Delete pomodoro records (for mistaken logs); the task's count is decremented too |
 | `focustodo_create_subtask` | Add a subtask (auto-flags the parent's `hasSubtask`) |
 | `focustodo_update_subtask` | Rename / complete / delete a subtask, or change its pomodoro estimate |
 | `focustodo_create_project` | Create a project or tag |
@@ -128,6 +129,8 @@ Tasks with no project land in the Inbox (magic id `id-task-tasks`) and are visib
 ⚠️ The Inbox is **not** a real project — it never appears in the `projects` array from `/v64/sync`. This server injects the name during enrichment and accepts "收件匣 / 收件箱 / inbox" as a query target.
 
 ⚠️ A task whose `projectId` is an **empty string** becomes a true orphan: it exists on the server but shows up in no view in the app. `create_task` therefore always falls back to the Inbox, and list/search filter out any historical orphans by default.
+
+Note also that **deleting a task does not delete its pomodoro records** — that focus time stays in your statistics, and "today's focus" will even show the deleted task's name. Use `delete_pomodoro` to remove them properly.
 
 For the same reason, **deleting a project does not touch the tasks inside it** — their `projectId` keeps pointing at a deleted project, leaving them invisible and unrecoverable. So `delete_project` requires `moveTasksTo` when the project isn't empty, and only deletes the project after every task has been moved successfully.
 

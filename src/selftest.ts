@@ -144,6 +144,26 @@ async function main() {
     assert.ok(logged.some((p) => p.id === pomo.id), "server 上應查得到這筆番茄鐘");
   });
 
+  // 刪任務不會刪它的番茄鐘，那些時間會永久留在統計裡。自測本身就是最大的污染源，
+  // 所以刪除能力與收尾清理都必須真的有效。
+  await check("番茄鐘可刪除，任務計數跟著扣回", async () => {
+    const id = createdIds[2];
+    const before = (await fromServer(id))!.actualPomoNum;
+    const pomo = await api.logPomodoro({ taskId: id, minutes: 30 });
+    assert.equal((await fromServer(id))!.actualPomoNum, before + 1);
+
+    const r = await api.deletePomodoros([pomo.id]);
+    assert.equal(r.deleted, 1);
+    assert.equal(r.focusSeconds, 1800, "應回報移除了 30 分鐘");
+
+    await verifier.refresh();
+    assert.ok(
+      !(await verifier.getPomodoros({ taskId: id })).some((p) => p.id === pomo.id),
+      "server 上不該再查得到這筆番茄鐘"
+    );
+    assert.equal((await fromServer(id))!.actualPomoNum, before, "任務的番茄計數應扣回原值");
+  });
+
   await check("更新任務：改名 + 搬清單，server 確認", async () => {
     const id = createdIds[0];
     await api.updateTask(id, { name: "[MCP自測] 已改名", priority: 3 });
@@ -312,6 +332,20 @@ async function main() {
 
   // 保險：中途失敗的測試會留下 [MCP自測] 資料，收尾統一掃一次
   try {
+    // ⚠️ 番茄鐘要先清，而且一定要清——刪任務不會連帶刪它的番茄鐘記錄，
+    // 那些時間會永久留在使用者的「今日專注」與統計裡，還會顯示已刪任務的名稱。
+    // 每跑一次自測就污染 25 分鐘，跑十次就是 250 分鐘的假資料。
+    await api.refresh();
+    const strayPomos: string[] = [];
+    for (const p of await api.getPomodoros()) {
+      const t = await api.getTaskById(p.taskId); // 不過濾 isDeleted，查得到已刪任務
+      if (t?.name.includes("[MCP自測]")) strayPomos.push(p.id);
+    }
+    if (strayPomos.length) {
+      const r = await api.deletePomodoros(strayPomos);
+      console.log(`🧹 清掉 ${r.deleted} 筆自測番茄鐘（${Math.round(r.focusSeconds / 60)} 分鐘）`);
+    }
+
     const strays = (await api.getTasks({ includeOrphans: true })).filter((t) =>
       t.name.includes("[MCP自測]")
     );

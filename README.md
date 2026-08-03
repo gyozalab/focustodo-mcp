@@ -82,6 +82,7 @@ npm run build
 | `focustodo_complete_task` | 標記完成，支援批次，`uncomplete` 可反向 |
 | `focustodo_delete_task` | 軟刪除，支援批次 |
 | `focustodo_log_pomodoro` | 補記已完成的專注時段，同步累加任務番茄計數 |
+| `focustodo_delete_pomodoro` | 刪除番茄鐘記錄（記錯時用），任務計數跟著扣回 |
 | `focustodo_create_subtask` | 新增子任務（自動標記父任務 `hasSubtask`）|
 | `focustodo_update_subtask` | 子任務改名／完成／刪除／改預估番茄數 |
 | `focustodo_create_project` | 建立新清單或標籤 |
@@ -128,6 +129,8 @@ node -e "console.log(require('crypto').randomUUID())"   # 產一個 token
 ⚠️ 收件匣**不是**一個真的 project，`/v64/sync` 的 `projects` 陣列裡沒有它。本 server 在 enrich 時特別補上名稱，也接受用「收件匣 / 收件箱 / inbox」查詢。
 
 ⚠️ 若 `projectId` 是**空字串**會變成「真孤兒」：server 上存在，但 App 任何視圖都不顯示。因此 `create_task` 一律 fallback 到收件匣，列表與搜尋也預設濾掉歷史殘留的孤兒卡。
+
+同樣要注意，**刪除任務不會刪掉它的番茄鐘記錄**——那些專注時間會繼續留在統計裡，「今日專注」甚至會顯示已刪任務的名稱。要真正移除得用 `delete_pomodoro`。
 
 同樣的道理，**刪除清單時 server 不會處理裡面的任務**——它們的 `projectId` 會繼續指向已刪清單，變成看不到也救不回的孤兒。所以 `delete_project` 在清單非空時會要求用 `moveTasksTo` 指定任務去處，搬移全部成功才會刪清單。
 

@@ -896,6 +896,54 @@ export class FocusToDoAPI {
     return pomo;
   }
 
+  /**
+   * 刪除番茄鐘記錄，並把父任務的 actualPomoNum 扣回去。
+   *
+   * ⚠️ 刪任務不會連帶刪它的番茄鐘——那些記錄會繼續留在統計裡，
+   * 「今日專注」還會顯示已刪任務的名稱。要真正移除得走這裡。
+   */
+  async deletePomodoros(pomodoroIds: string[]): Promise<{ deleted: number; focusSeconds: number }> {
+    await this.freshData();
+
+    const targets = this._pomodoros.filter(
+      (p) => pomodoroIds.includes(p.id) && p.state !== STATE_DELETED
+    );
+    if (!targets.length) return { deleted: 0, focusSeconds: 0 };
+
+    // 父任務的計數要跟著減，否則 App 上的 🍅 數字會虛高
+    const decrement = new Map<string, number>();
+    for (const p of targets) decrement.set(p.taskId, (decrement.get(p.taskId) ?? 0) + 1);
+    const taskPatches: Task[] = [];
+    for (const [taskId, n] of decrement) {
+      const task = this._tasks.find((t) => t.id === taskId);
+      if (task) taskPatches.push({ ...task, actualPomoNum: Math.max(0, task.actualPomoNum - n) });
+    }
+
+    const removed = targets.map((p) => ({ ...p, state: STATE_DELETED }));
+    const pushedAt = Date.now();
+    await this.sync({ pomodoros: removed, tasks: taskPatches });
+    this.mergeArray(this._pomodoros, removed);
+    if (taskPatches.length) this.mergeArray(this._tasks, taskPatches);
+
+    const rejected = await this.verifyApplied(
+      "pomodoros",
+      removed.map((p) => ({ id: p.id, fields: { state: STATE_DELETED } })),
+      pushedAt
+    );
+    if (rejected.length) {
+      this.lastFetchedAt = 0;
+      throw new Error(
+        `${rejected.length}/${removed.length} 筆番茄鐘無法確認刪除：` +
+        rejected.map((r) => r.reason).join("; ")
+      );
+    }
+
+    return {
+      deleted: removed.length,
+      focusSeconds: targets.reduce((s, p) => s + p.interval, 0),
+    };
+  }
+
   // ===== 清單 =====
 
   async createProject(params: {
