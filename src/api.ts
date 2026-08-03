@@ -26,7 +26,7 @@ export const INBOX_PROJECT_ID = "id-task-tasks";
 /** 本地快取存活時間。超過就重新拉 delta，避免 MCP 常駐後讀到過期資料。 */
 const CACHE_TTL_MS = 60_000;
 
-/** state 欄位語義（實測 1338 筆任務歸納）：0=正常、-1=已刪除 */
+/** state 欄位語義（實測歸納）：0=正常、-1=已刪除 */
 const STATE_ACTIVE = 0;
 const STATE_DELETED = -1;
 
@@ -427,7 +427,7 @@ export class FocusToDoAPI {
       // 找不到要明說。靜默回空陣列會讓使用者以為清單是空的，而不是名字打錯了。
       const project = this.mustFindProject(filters.projectName);
       if (project.type === TYPE_TAG) {
-        // 標籤型清單（Blog、iPAS 等）：tags 欄位存的是 project ID
+        // 標籤型清單：tags 欄位存的是 project ID
         tasks = tasks.filter((t) => t.tags.includes(project.id));
       } else if (project.id === INBOX_PROJECT_ID) {
         tasks = tasks.filter((t) => t.projectId === INBOX_PROJECT_ID);
@@ -681,7 +681,7 @@ export class FocusToDoAPI {
   /**
    * 拉 delta，讀 server 的真實持久層狀態。
    *
-   * 用 delta 而非 fullSync：fullSync 回應包含全部 1600+ 筆任務，光傳輸就 2MB，
+   * 用 delta 而非 fullSync：帳號用久了 fullSync 回應可達數 MB，
    * 拿來驗證單筆寫入太重。
    *
    * 註：舊版註解聲稱「clientId 必須是新的，否則 server 會過濾掉自己 push 的

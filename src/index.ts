@@ -125,7 +125,7 @@ function buildServer(): McpServer {
 
   server.tool(
     "focustodo_list_projects",
-    "列出所有清單與標籤（如：工作 Work、書寫 Output、Blog 等）。建任務前若不確定清單名稱，先呼叫這個。",
+    "列出所有清單與標籤。建任務前若不確定清單名稱，先呼叫這個。",
     {},
     async () => {
       try {
@@ -145,10 +145,10 @@ function buildServer(): McpServer {
 
   server.tool(
     "focustodo_list_tasks",
-    "列出任務，可依清單、標籤、優先級、完成狀態、到期日篩選。查詢任務的主要工具 —— 使用者說「列出 Blog 任務」「書寫 Output 有什麼」時用這個並傳 projectName。⚠️ 預設過濾「真孤兒」殭屍卡（projectId 為空、App 看不到），除錯才開 includeOrphans。",
+    "列出任務，可依清單、標籤、優先級、完成狀態、到期日篩選。查詢任務的主要工具 —— 使用者說「列出某某清單的任務」「某某清單有什麼」時用這個並傳 projectName。⚠️ 預設過濾「真孤兒」殭屍卡（projectId 為空、App 看不到），除錯才開 includeOrphans。",
     {
-      projectName: z.string().optional().describe("清單或標籤名稱（模糊匹配，如 'Blog'、'書寫'）"),
-      tag: z.string().optional().describe("只篩標籤（如 'Blog'、'iPAS AI 中級'）"),
+      projectName: z.string().optional().describe("清單或標籤名稱（模糊匹配，可只給部分文字）"),
+      tag: z.string().optional().describe("只篩標籤"),
       priority: z.number().min(0).max(3).optional().describe("優先級：0=無, 1=低, 2=中, 3=高"),
       isFinished: z.boolean().optional().describe("true=已完成, false=未完成"),
       due: z.enum(["overdue", "today", "week"]).optional()
@@ -161,7 +161,7 @@ function buildServer(): McpServer {
       try {
         const tasks = await api.getTasks(params);
         // 未完成優先。少了這道，長年累積的已完成任務會把待辦擠出前 20 名
-        // ——實測「工作 Work」424 筆裡只有 4 筆未完成，卻排在第 1、3 名之後就沒了。
+        // ——長年使用的清單裡已完成往往佔絕大多數，未完成的剩個位數。
         const sorted = tasks.sort((a, b) => {
           if (a.isFinished !== b.isFinished) return a.isFinished ? 1 : -1;
           if (a.priority !== b.priority) return b.priority - a.priority;
@@ -302,7 +302,7 @@ function buildServer(): McpServer {
     {
       period: z.enum(["today", "this_week", "this_month", "last_7_days", "last_30_days", "all"])
         .optional().default("this_week").describe("時間範圍"),
-      projectName: z.string().optional().describe("清單或標籤名稱（如 'Blog'）"),
+      projectName: z.string().optional().describe("清單或標籤名稱"),
       showDaily: z.boolean().optional().default(true).describe("是否顯示每日分佈"),
     },
     async (params) => {
@@ -366,8 +366,8 @@ function buildServer(): McpServer {
   const taskInput = {
     name: z.string().describe("任務名稱"),
     projectName: z.string().optional()
-      .describe("清單名稱（如 'Blog'、'書寫 Output'）。省略則落在收件匣。找不到會報錯，不會靜默丟失。"),
-    tags: z.string().optional().describe("標籤名稱，逗號或空白分隔（如 'Blog, iPAS'）。必須是已存在的標籤。"),
+      .describe("清單名稱。省略則落在收件匣。找不到會報錯，不會靜默丟失。"),
+    tags: z.string().optional().describe("標籤名稱，逗號或空白分隔。必須是已存在的標籤。"),
     priority: z.number().min(0).max(3).optional().describe("優先級：0=無, 1=低, 2=中, 3=高"),
     estimatePomoNum: z.number().optional().describe("預估番茄數"),
     deadline: z.string().optional().describe("到期日（'2026-08-05' 會設成當天 23:59:59）"),

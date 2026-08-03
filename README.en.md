@@ -50,7 +50,7 @@ Restart Claude and you're ready to go.
 
 Once configured, just ask your AI assistant:
 
-- "List my tasks in the Blog project"
+- "List my tasks in the blog project"
 - "Add a task to Writing Output: draft the AI tool review, 3 pomodoros"
 - "Add these five things to Writing Output at once"
 - "Which project did I spend the most time on this week?"
