@@ -518,6 +518,8 @@ export class FocusToDoAPI {
       estimatePomoNum?: number;
       deadline?: number;
       remark?: string;
+      reminderDate?: number;
+      pomodoroInterval?: number;
     }[]
   ): Promise<Task[]> {
     await this.ensureData();
@@ -543,9 +545,9 @@ export class FocusToDoAPI {
         priority: params.priority ?? 0,
         estimatePomoNum: params.estimatePomoNum ?? 0,
         actualPomoNum: 0,
-        pomodoroInterval: 1500,
+        pomodoroInterval: params.pomodoroInterval ?? 1500,
         deadline: params.deadline ?? 0,
-        reminderDate: 0,
+        reminderDate: params.reminderDate ?? 0,
         creationDate: now,
         finishedDate: 0,
         isFinished: false,
@@ -929,6 +931,107 @@ export class FocusToDoAPI {
     return project;
   }
 
+  /** 清單改名／改色。收件匣是 magic 不是真 project，改不了。 */
+  async updateProject(
+    nameOrId: string,
+    updates: { name?: string; color?: string }
+  ): Promise<Project> {
+    await this.freshData();
+
+    const target = this.resolveProject(nameOrId);
+    if (updates.name && updates.name !== target.name) {
+      const clash = this._projects.find(
+        (p) =>
+          p.id !== target.id &&
+          !p.isDeleted &&
+          isRealProject(p) &&
+          p.name.toLowerCase() === updates.name!.toLowerCase()
+      );
+      if (clash) throw new Error(`已經有一個叫「${updates.name}」的${clash.type === TYPE_TAG ? "標籤" : "清單"}了`);
+    }
+
+    // ⚠️ 一定要濾掉 undefined。`{...target, color: undefined}` 會把原本的顏色蓋掉，
+    // JSON.stringify 再把該欄位整個省略，server 收到不完整物件就回 status=-9。
+    // 呼叫端傳「沒有要改的欄位＝undefined」是很自然的寫法，防在這裡而非要求每個呼叫端自律。
+    const clean = Object.fromEntries(Object.entries(updates).filter(([, v]) => v !== undefined));
+    const updated: Project = { ...target, ...clean };
+    const pushedAt = Date.now();
+    await this.sync({ projects: [updated] });
+    this.mergeArray(this._projects, [updated]);
+
+    await this.verifyOneOrThrow("projects", updated.id, { name: updated.name }, pushedAt);
+    return updated;
+  }
+
+  /**
+   * 刪除清單。
+   *
+   * ⚠️ 實測：server 刪清單時不會動裡面的任務——它們的 projectId 會繼續指向
+   * 一個已刪除的清單，在 App 任何視圖都看不到，也救不回來。所以這裡不允許
+   * 靜默留下孤兒：清單裡還有活著的任務時，呼叫端一定要指定去處。
+   */
+  async deleteProject(
+    nameOrId: string,
+    opts?: { moveTasksTo?: string }
+  ): Promise<{ project: Project; movedTasks: number; movedTo?: string }> {
+    await this.freshData();
+
+    const target = this.resolveProject(nameOrId);
+    const isTag = target.type === TYPE_TAG;
+
+    // 標籤沒有 projectId 歸屬問題，任務只是 tags 欄位引用它
+    const inside = isTag
+      ? []
+      : this._tasks.filter((t) => t.projectId === target.id && !t.isDeleted);
+
+    let movedTo: Project | undefined;
+    if (inside.length) {
+      if (!opts?.moveTasksTo) {
+        throw new Error(
+          `「${target.name}」裡還有 ${inside.length} 個未刪除的任務。` +
+          `直接刪清單會讓它們變成 App 看不到的孤兒，所以請先指定 moveTasksTo` +
+          `（要搬去的清單名稱，可用「收件匣」），或先自行刪掉那些任務。`
+        );
+      }
+      // 用 mustFindProject 而非 resolveProject：後者擋的是「不能被改動的目標」，
+      // 而收件匣雖然改不了名也刪不掉，卻正是最常見的搬移去處。
+      movedTo = this.mustFindProject(opts.moveTasksTo);
+      if (movedTo.id === target.id) throw new Error("不能把任務搬到正在刪除的清單");
+      if (movedTo.type === TYPE_TAG) throw new Error(`「${movedTo.name}」是標籤不是清單，不能當任務的去處`);
+
+      const moved = await this.updateTasks(
+        inside.map((t) => t.id),
+        { projectId: movedTo.id }
+      );
+      if (moved.failed.length) {
+        throw new Error(
+          `搬移任務時有 ${moved.failed.length} 個失敗，清單未刪除（避免製造孤兒）：` +
+          moved.failed.map((f) => f.reason).join("; ")
+        );
+      }
+    }
+
+    const deleted: Project = { ...target, isDeleted: true, state: STATE_DELETED };
+    const pushedAt = Date.now();
+    await this.sync({ projects: [deleted] });
+    this.mergeArray(this._projects, [deleted]);
+
+    await this.verifyOneOrThrow("projects", deleted.id, { isDeleted: true }, pushedAt);
+    return { project: deleted, movedTasks: inside.length, movedTo: movedTo?.name };
+  }
+
+  /** 依名稱或 ID 找清單／標籤，並擋掉不能被改動的目標 */
+  private resolveProject(nameOrId: string): Project {
+    const byId = this._projects.find((p) => p.id === nameOrId && isRealProject(p));
+    const found = byId ?? this.findProject(nameOrId);
+    if (!found) return this.mustFindProject(nameOrId); // 借用它的錯誤訊息（會列出可選項）
+    if (found.id === INBOX_PROJECT_ID) {
+      throw new Error("收件匣是系統內建的，不能改名或刪除");
+    }
+    if (found.isDefault) throw new Error(`「${found.name}」是預設清單，不能改名或刪除`);
+    return found;
+  }
+
   // ===== 統計 API =====
 
   async getStats(filters?: {
@@ -1035,6 +1138,7 @@ export type TaskPatch = Partial<
     Task,
     | "name" | "tags" | "priority" | "estimatePomoNum" | "deadline" | "remark"
     | "projectId" | "isFinished" | "finishedDate" | "isDeleted" | "state"
+    | "reminderDate" | "pomodoroInterval"
   >
 > & { projectName?: string };
 

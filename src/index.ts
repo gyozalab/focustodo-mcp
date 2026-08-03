@@ -71,6 +71,23 @@ function failWith(error: unknown) {
   return fail(`❌ FocusTodo 錯誤：${error instanceof Error ? error.message : String(error)}`);
 }
 
+/**
+ * tool 層的友善欄位 → server 欄位。
+ * 只輸出有指定的欄位，所以 create（沒給就用預設）與 update（沒給就不改）共用同一份。
+ * 傳空字串代表清除（deadline/reminderAt → 0）。
+ */
+function toServerFields(i: {
+  deadline?: string;
+  reminderAt?: string;
+  pomodoroMinutes?: number;
+}): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (i.deadline !== undefined) out.deadline = i.deadline ? parseDeadline(i.deadline) : 0;
+  if (i.reminderAt !== undefined) out.reminderDate = i.reminderAt ? parseDeadline(i.reminderAt) : 0;
+  if (i.pomodoroMinutes !== undefined) out.pomodoroInterval = Math.round(i.pomodoroMinutes * 60);
+  return out;
+}
+
 /** 批次寫入的回報。部分成功要講清楚哪些過、哪些沒過。 */
 function batchReport(
   verb: string,
@@ -143,7 +160,10 @@ function buildServer(): McpServer {
     async (params) => {
       try {
         const tasks = await api.getTasks(params);
+        // 未完成優先。少了這道，長年累積的已完成任務會把待辦擠出前 20 名
+        // ——實測「工作 Work」424 筆裡只有 4 筆未完成，卻排在第 1、3 名之後就沒了。
         const sorted = tasks.sort((a, b) => {
+          if (a.isFinished !== b.isFinished) return a.isFinished ? 1 : -1;
           if (a.priority !== b.priority) return b.priority - a.priority;
           return b.creationDate - a.creationDate;
         });
@@ -352,6 +372,10 @@ function buildServer(): McpServer {
     estimatePomoNum: z.number().optional().describe("預估番茄數"),
     deadline: z.string().optional().describe("到期日（'2026-08-05' 會設成當天 23:59:59）"),
     remark: z.string().optional().describe("備註內容"),
+    reminderAt: z.string().optional()
+      .describe("提醒時間（ISO 格式，如 '2026-08-05T09:00'）。App 會在此時發通知。"),
+    pomodoroMinutes: z.number().positive().optional()
+      .describe("這個任務每個番茄鐘幾分鐘（預設 25）"),
   };
 
   server.tool(
@@ -368,7 +392,10 @@ function buildServer(): McpServer {
         if (!items) return fail("❌ 請提供 name（單筆）或 tasks 陣列（批次）");
 
         const created = await api.createTasks(
-          items.map((i) => ({ ...i, deadline: i.deadline ? parseDeadline(i.deadline) : undefined }))
+          items.map(({ deadline, reminderAt, pomodoroMinutes, ...rest }) => ({
+            ...rest,
+            ...toServerFields({ deadline, reminderAt, pomodoroMinutes }),
+          }))
         );
 
         const lines = created.map((t, i) => {
@@ -384,7 +411,7 @@ function buildServer(): McpServer {
 
   server.tool(
     "focustodo_update_task",
-    "修改任務的名稱、優先級、到期日、標籤、所屬清單、備註。寫入後會向 server 驗證，回 ✅ 才代表真的更新了。",
+    "修改任務的名稱、優先級、到期日、提醒時間、標籤、所屬清單、備註、番茄長度。寫入後會向 server 驗證，回 ✅ 才代表真的更新了。",
     {
       taskId: z.string().describe("任務 ID"),
       name: z.string().optional().describe("新名稱"),
@@ -394,16 +421,16 @@ function buildServer(): McpServer {
       estimatePomoNum: z.number().optional().describe("新預估番茄數"),
       deadline: z.string().optional().describe("新到期日（'2026-08-05'，傳空字串清除）"),
       remark: z.string().optional().describe("新備註"),
+      reminderAt: z.string().optional()
+        .describe("新提醒時間（ISO 格式，如 '2026-08-05T09:00'，傳空字串清除）"),
+      pomodoroMinutes: z.number().positive().optional().describe("這個任務每個番茄鐘幾分鐘"),
     },
-    async ({ taskId, ...fields }) => {
+    async ({ taskId, deadline, reminderAt, pomodoroMinutes, ...fields }) => {
       try {
-        const updates: Record<string, unknown> = Object.fromEntries(
-          Object.entries(fields).filter(([, v]) => v !== undefined)
-        );
-        // deadline 是唯一要轉型的：字串日期 → epoch ms，空字串代表清除
-        if (updates.deadline !== undefined) {
-          updates.deadline = fields.deadline ? parseDeadline(fields.deadline) : 0;
-        }
+        const updates: Record<string, unknown> = {
+          ...Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined)),
+          ...toServerFields({ deadline, reminderAt, pomodoroMinutes }),
+        };
         if (!Object.keys(updates).length) return fail("❌ 沒有指定任何要修改的欄位");
 
         const task = await api.updateTask(taskId, updates);
@@ -460,12 +487,14 @@ function buildServer(): McpServer {
       taskId: z.string().describe("任務 ID"),
       minutes: z.number().positive().describe("專注了幾分鐘"),
       endedAt: z.string().optional().describe("結束時間（ISO 格式，如 '2026-08-02T15:30'）。省略則用現在。"),
+      subtaskId: z.string().optional()
+        .describe("記到哪個子任務（ID 從 focustodo_get_task_detail 取得）。省略則只記在父任務上。"),
     },
-    async ({ taskId, minutes, endedAt }) => {
+    async ({ taskId, minutes, endedAt, subtaskId }) => {
       try {
         const endDate = endedAt ? new Date(endedAt).getTime() : undefined;
         if (endedAt && Number.isNaN(endDate!)) return fail(`❌ 無法解析時間：${endedAt}`);
-        const pomo = await api.logPomodoro({ taskId, minutes, endDate });
+        const pomo = await api.logPomodoro({ taskId, minutes, endDate, subtaskId });
         const task = await api.getTaskById(taskId);
         return text(
           `✅ 已補記 ${formatSeconds(pomo.interval)} 專注到「${task?.name}」\n` +
@@ -504,6 +533,7 @@ function buildServer(): McpServer {
       name: z.string().optional().describe("新名稱"),
       isFinished: z.boolean().optional().describe("true=完成, false=取消完成"),
       isDeleted: z.boolean().optional().describe("true=刪除"),
+      estimatedPomoNum: z.number().optional().describe("新的預估番茄數"),
     },
     async ({ subtaskId, ...updates }) => {
       try {
@@ -531,6 +561,47 @@ function buildServer(): McpServer {
       try {
         const p = await api.createProject(params);
         return text(`✅ 已建立${params.isTag ? "標籤" : "清單"}「${p.name}」\nid: ${p.id}`);
+      } catch (error) {
+        return failWith(error);
+      }
+    }
+  );
+
+  server.tool(
+    "focustodo_update_project",
+    "清單或標籤改名、換顏色。收件匣與預設清單改不了。",
+    {
+      name: z.string().describe("目前的清單／標籤名稱（或 ID）"),
+      newName: z.string().optional().describe("新名稱"),
+      color: z.string().optional().describe("新顏色 hex（如 '#4A90D9'）"),
+    },
+    async ({ name, newName, color }) => {
+      try {
+        if (!newName && !color) return fail("❌ 請指定 newName 或 color");
+        const p = await api.updateProject(name, { name: newName, color });
+        return text(`✅ 已更新${p.type === TYPE_TAG ? "標籤" : "清單"}「${p.name}」（server 已確認）`);
+      } catch (error) {
+        return failWith(error);
+      }
+    }
+  );
+
+  server.tool(
+    "focustodo_delete_project",
+    "刪除清單或標籤。⚠️ 清單裡若還有未完成的任務，必須用 moveTasksTo 指定它們要搬去哪 ——" +
+    " server 刪清單時不會處理裡面的任務，直接刪會讓它們變成 App 看不到也救不回的孤兒。",
+    {
+      name: z.string().describe("要刪除的清單／標籤名稱（或 ID）"),
+      moveTasksTo: z.string().optional()
+        .describe("裡面的任務要搬去哪個清單（如 '收件匣'）。清單非空時必填。"),
+    },
+    async ({ name, moveTasksTo }) => {
+      try {
+        const r = await api.deleteProject(name, { moveTasksTo });
+        const moved = r.movedTasks
+          ? `\n先把 ${r.movedTasks} 個任務搬到「${r.movedTo}」`
+          : "";
+        return text(`✅ 已刪除「${r.project.name}」（server 已確認）${moved}`);
       } catch (error) {
         return failWith(error);
       }

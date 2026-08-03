@@ -215,6 +215,72 @@ async function main() {
     createdIds.length = 0;
   });
 
+  await check("提醒時間與番茄長度存得進 server", async () => {
+    const [t] = await api.createTasks([
+      {
+        name: "[MCP自測] 提醒與番茄長度",
+        reminderDate: parseDeadline("2026-12-30T09:00"),
+        pomodoroInterval: 50 * 60,
+      },
+    ]);
+    createdIds.push(t.id);
+    const onServer = await fromServer(t.id);
+    assert.equal(onServer!.pomodoroInterval, 3000, "番茄長度應為 50 分鐘");
+    assert.equal(new Date(onServer!.reminderDate).getHours(), 9, "提醒應在早上 9 點");
+
+    await api.updateTask(t.id, { reminderDate: 0, pomodoroInterval: 1500 });
+    const cleared = await fromServer(t.id);
+    assert.equal(cleared!.reminderDate, 0, "提醒應可清除");
+    assert.equal(cleared!.pomodoroInterval, 1500);
+
+    await api.deleteTasks([t.id]);
+    createdIds.splice(createdIds.indexOf(t.id), 1);
+  });
+
+  // 刪清單是唯一會造成不可逆孤兒的操作：實測 server 刪清單時不動裡面的任務，
+  // 它們的 projectId 會指向已刪清單，在 App 任何視圖都看不到也救不回來。
+  await check("清單改名；刪除時不准把任務留成孤兒", async () => {
+    const proj = await api.createProject({ name: "[MCP自測] 清單甲" });
+    // 照 tool 的方式呼叫：沒指定的欄位是 undefined，不是省略。
+    // 之前寫成 { name } 省略 color，就漏掉了「undefined 會蓋掉原值害 server 回 -9」這個 bug。
+    const renamed = await api.updateProject("[MCP自測] 清單甲", {
+      name: "[MCP自測] 清單乙",
+      color: undefined,
+    });
+    assert.equal(renamed.name, "[MCP自測] 清單乙");
+    assert.ok(renamed.color, "顏色不該被 undefined 蓋掉");
+
+    const [inside] = await api.createTasks([{ name: "[MCP自測] 清單內任務", projectId: proj.id }]);
+
+    // 非空清單不給去處 → 必須擋下來，且清單不能被刪
+    await assert.rejects(api.deleteProject("[MCP自測] 清單乙"), /moveTasksTo|孤兒/);
+    assert.ok(
+      (await api.getProjects()).some((p) => p.id === proj.id),
+      "被擋下時清單不該已經被刪掉"
+    );
+
+    // 給了去處 → 任務先搬走，清單才刪
+    const r = await api.deleteProject("[MCP自測] 清單乙", { moveTasksTo: "收件匣" });
+    assert.equal(r.movedTasks, 1);
+    await verifier.refresh();
+    assert.equal(
+      (await verifier.getTaskById(inside.id))!.projectId,
+      INBOX_PROJECT_ID,
+      "任務應已搬到收件匣，不能留在已刪清單裡"
+    );
+    assert.ok(
+      !(await verifier.getProjects()).some((p) => p.id === proj.id),
+      "清單應已刪除"
+    );
+
+    await api.deleteTasks([inside.id]);
+  });
+
+  await check("收件匣不能被改名或刪除", async () => {
+    await assert.rejects(api.updateProject("收件匣", { name: "亂改" }), /系統內建/);
+    await assert.rejects(api.deleteProject("收件匣"), /系統內建/);
+  });
+
   // Codex review 抓到的回歸：驗證讀取拿到 status!=0 時，原本 `data[kind] || []`
   // 會把它讀成「空的 delta」，於是已生效的寫入被報成失敗——2026-04-29 的同型錯誤。
   //
@@ -243,6 +309,23 @@ async function main() {
   });
 
   await checkHttpMode();
+
+  // 保險：中途失敗的測試會留下 [MCP自測] 資料，收尾統一掃一次
+  try {
+    const strays = (await api.getTasks({ includeOrphans: true })).filter((t) =>
+      t.name.includes("[MCP自測]")
+    );
+    if (strays.length) {
+      await api.deleteTasks(strays.map((t) => t.id));
+      console.log(`🧹 清掉 ${strays.length} 張殘留的自測卡`);
+    }
+    for (const p of (await api.getProjects()).filter((p) => p.name.includes("[MCP自測]"))) {
+      await api.deleteProject(p.id, { moveTasksTo: "收件匣" });
+      console.log(`🧹 清掉殘留的自測清單「${p.name}」`);
+    }
+  } catch (e) {
+    console.log("⚠️  自動清理失敗，請在 App 搜尋「[MCP自測]」手動刪除:", e instanceof Error ? e.message : e);
+  }
 
   console.log(failed ? `\n❌ ${failed} 項失敗` : "\n✅ 全部通過");
   if (createdIds.length) {
