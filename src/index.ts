@@ -302,39 +302,68 @@ function buildServer(): McpServer {
     "查詢專注統計（可按時間範圍和清單篩選），含每日分佈。",
     {
       period: z.enum(["today", "this_week", "this_month", "last_7_days", "last_30_days", "all"])
-        .optional().default("this_week").describe("時間範圍"),
+        .optional().default("this_week").describe("時間範圍（被 month／startDate／endDate 蓋過）"),
+      month: z.string().regex(/^\d{4}-\d{2}$/).optional()
+        .describe("指定月份 YYYY-MM，可回溯任意歷史月份（月報用）"),
+      startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+        .describe("自訂起日 YYYY-MM-DD（含當日）"),
+      endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+        .describe("自訂迄日 YYYY-MM-DD（含當日）"),
       projectName: z.string().optional().describe("清單或標籤名稱"),
       showDaily: z.boolean().optional().default(true).describe("是否顯示每日分佈"),
+      maxDailyDays: z.number().int().positive().optional()
+        .describe("每日分佈最多顯示幾天。預設 14；指定 month 或自訂區間時預設顯示整段"),
     },
     async (params) => {
       try {
         const now = new Date();
+        const parseYmd = (s: string, dayOffset = 0) => {
+          const [y, m, d] = s.split("-").map(Number);
+          return new Date(y, m - 1, d + dayOffset).getTime();
+        };
+
         let startDate: number | undefined;
-        switch (params.period) {
-          case "today":
-            startDate = todayBounds().start;
-            break;
-          case "this_week": {
-            const d = new Date(now);
-            d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // 週一為起點
-            d.setHours(0, 0, 0, 0);
-            startDate = d.getTime();
-            break;
+        let endDate: number | undefined; // 排他上界
+        let rangeLabel: string;
+        const customRange = Boolean(params.month || params.startDate || params.endDate);
+
+        if (params.month) {
+          const [y, m] = params.month.split("-").map(Number);
+          startDate = new Date(y, m - 1, 1).getTime();
+          endDate = new Date(y, m, 1).getTime();
+          rangeLabel = params.month;
+        } else if (params.startDate || params.endDate) {
+          if (params.startDate) startDate = parseYmd(params.startDate);
+          if (params.endDate) endDate = parseYmd(params.endDate, 1);
+          rangeLabel = `${params.startDate ?? "最早"} ~ ${params.endDate ?? "今天"}`;
+        } else {
+          switch (params.period) {
+            case "today":
+              startDate = todayBounds().start;
+              break;
+            case "this_week": {
+              const d = new Date(now);
+              d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // 週一為起點
+              d.setHours(0, 0, 0, 0);
+              startDate = d.getTime();
+              break;
+            }
+            case "this_month":
+              startDate = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+              break;
+            case "last_7_days":
+              startDate = todayBounds().start - 6 * 86400000;
+              break;
+            case "last_30_days":
+              startDate = todayBounds().start - 29 * 86400000;
+              break;
           }
-          case "this_month":
-            startDate = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-            break;
-          case "last_7_days":
-            startDate = todayBounds().start - 6 * 86400000;
-            break;
-          case "last_30_days":
-            startDate = todayBounds().start - 29 * 86400000;
-            break;
+          rangeLabel = params.period;
         }
 
-        const stats = await api.getStats({ startDate, projectName: params.projectName });
+        const stats = await api.getStats({ startDate, endDate, projectName: params.projectName });
 
-        let out = `📊 專注統計（${params.period}${params.projectName ? ` · ${params.projectName}` : ""}）\n\n`;
+        let out = `📊 專注統計（${rangeLabel}${params.projectName ? ` · ${params.projectName}` : ""}）\n\n`;
         out += `總專注時間: ${formatSeconds(stats.totalFocusTime)}\n`;
         out += `番茄鐘數: ${stats.totalPomodoros} 個\n`;
         out += `完成任務: ${stats.completedTasks} 個\n`;
@@ -347,7 +376,8 @@ function buildServer(): McpServer {
           }
         }
         if (params.showDaily && stats.dailyBreakdown.length) {
-          const recent = stats.dailyBreakdown.slice(-14);
+          const limit = params.maxDailyDays ?? (customRange ? stats.dailyBreakdown.length : 14);
+          const recent = stats.dailyBreakdown.slice(-limit);
           const max = Math.max(...recent.map((d) => d.focusTime), 1);
           out += `\n📈 每日分佈（最近 ${recent.length} 天）:\n`;
           for (const d of recent) {

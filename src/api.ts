@@ -1084,6 +1084,7 @@ export class FocusToDoAPI {
 
   async getStats(filters?: {
     startDate?: number;
+    endDate?: number;
     projectName?: string;
   }): Promise<{
     totalFocusTime: number;
@@ -1099,6 +1100,8 @@ export class FocusToDoAPI {
     let tasks = this._tasks.filter((t) => !t.isDeleted);
 
     if (filters?.startDate) pomos = pomos.filter((p) => p.endDate >= filters.startDate!);
+    // endDate 為排他上界（呼叫端傳區間結束日的隔天 00:00），用於框出歷史區間如「只要 7 月」
+    if (filters?.endDate) pomos = pomos.filter((p) => p.endDate < filters.endDate!);
 
     if (filters?.projectName) {
       const project = this.mustFindProject(filters.projectName);
@@ -1113,7 +1116,10 @@ export class FocusToDoAPI {
 
     // 完成數只算範圍內完成的，否則 "本週統計" 會混進歷史累計
     const completedTasks = tasks.filter(
-      (t) => t.isFinished && (!filters?.startDate || t.finishedDate >= filters.startDate)
+      (t) =>
+        t.isFinished &&
+        (!filters?.startDate || t.finishedDate >= filters.startDate) &&
+        (!filters?.endDate || t.finishedDate < filters.endDate)
     ).length;
 
     const projectMap = new Map<string, { focusTime: number; pomodoros: number }>();

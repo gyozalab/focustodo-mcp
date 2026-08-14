@@ -70,7 +70,7 @@ npm run build
 | `focustodo_search_tasks` | 依關鍵字搜尋名稱、標籤、備註 |
 | `focustodo_get_task_detail` | 查看任務詳情（含子任務與番茄鐘紀錄）|
 | `focustodo_get_today_focus` | 今日總覽：已專注時間 + 今天到期 + 逾期未完成 |
-| `focustodo_get_stats` | 專注統計，含清單分佈與每日長條圖 |
+| `focustodo_get_stats` | 專注統計，含清單分佈與每日長條圖。可用 `month`（YYYY-MM）或 `startDate`／`endDate` 回溯任意歷史區間 |
 | `focustodo_refresh` | 強制重新同步（快取預設 60 秒自動更新）|
 
 ### 寫入
