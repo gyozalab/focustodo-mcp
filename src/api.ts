@@ -14,7 +14,16 @@ import type {
   EnrichedTask,
 } from "./types.js";
 
-const BASE_URL = "https://app.hk1.focustodo.net";
+/**
+ * 伺服器清單，順序照官方 Chrome 擴充功能（7.1.1 main.js refreshServerAccessInfo）。
+ * 官方 client 本來就是多台輪替：2026-09-17 app.hk1 整台拒絕連線（80/443 皆 refused），
+ * 手機 App 照常同步，就是因為它會自動換到 www。單寫死一台等於把對方的備援丟掉。
+ * FOCUSTODO_BASE_URL 可強制指定單一台（除錯用）。
+ */
+const SERVERS = process.env.FOCUSTODO_BASE_URL
+  ? [process.env.FOCUSTODO_BASE_URL.replace(/\/+$/, "")]
+  : ["https://www.focustodo.net", "https://app.hk1.focustodo.net"];
+let activeServer = 0;
 const CLIENT_NAME = "focustodo-mcp";
 const FETCH_TIMEOUT_MS = 30_000;
 const MAX_SYNC_RETRIES = 3;
@@ -85,6 +94,28 @@ async function fetchWithTimeout(
   }
 }
 
+/**
+ * 對目前這台伺服器送請求；連不上（DNS／拒絕連線／逾時）就換下一台，全部失敗才 throw。
+ * 換台後舊 session cookie 屬於另一台，sync 會回 -1/-2，由既有的重登邏輯接手。
+ * HTTP 錯誤（5xx 等）不換台：那代表伺服器活著，換台只會掩蓋問題。
+ */
+async function fetchServer(path: string, init: RequestInit): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < SERVERS.length; i++) {
+    const idx = (activeServer + i) % SERVERS.length;
+    try {
+      const res = await fetchWithTimeout(`${SERVERS[idx]}${path}`, init);
+      activeServer = idx;
+      return res;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  const code = (lastErr as { cause?: { code?: string } } | undefined)?.cause?.code;
+  const msg = `${lastErr instanceof Error ? lastErr.message : String(lastErr)}${code ? ` (${code})` : ""}`;
+  throw new Error(`所有番茄鐘伺服器都連不上（${SERVERS.join("、")}）：${msg}`);
+}
+
 /** 讀 JSON 並先檢查 HTTP 狀態。少了這層，server 回 502 HTML 時
  *  錯誤訊息會是看不懂的 `Unexpected token '<'`。 */
 async function readJson<T>(res: Response, what: string): Promise<T> {
@@ -137,7 +168,7 @@ export class FocusToDoAPI {
       client: CLIENT_NAME,
     });
 
-    const res = await fetchWithTimeout(`${BASE_URL}/v63/user/login`, {
+    const res = await fetchServer("/v63/user/login", {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -201,7 +232,7 @@ export class FocusToDoAPI {
       uid: creds.uid,
     });
 
-    const res = await fetchWithTimeout(`${BASE_URL}/v64/sync`, {
+    const res = await fetchServer("/v64/sync", {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
