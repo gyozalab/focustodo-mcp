@@ -15,17 +15,24 @@ import type {
 } from "./types.js";
 
 /**
- * 伺服器清單，順序照官方 Chrome 擴充功能（7.1.1 main.js refreshServerAccessInfo）。
- * 官方 client 本來就是多台輪替：2026-09-17 app.hk1 整台拒絕連線（80/443 皆 refused），
- * 手機 App 照常同步，就是因為它會自動換到 www。單寫死一台等於把對方的備援丟掉。
+ * 伺服器清單。官方 client 本來就是多台輪替：2026-09-17 app.hk1 整台拒絕連線
+ * （80/443 皆 refused），手機 App 照常同步，就是因為它會自動換到 www。
+ * 單寫死一台等於把對方的備援丟掉。
+ *
+ * 順序刻意和官方擴充功能（www 在前）相反，hk1 優先。2026-10-09 從台灣實測
+ * 2MB 全量同步：hk1 穩定 17 秒；www 15～77 秒、忽快忽慢，表頭也慢 10 倍。
+ * hk1 掛掉時是「拒絕連線」，瞬間就換到 www，放前面幾乎沒有代價；
+ * www 放前面則是每次冷啟動都賭它今天慢不慢。
  * FOCUSTODO_BASE_URL 可強制指定單一台（除錯用）。
  */
 const SERVERS = process.env.FOCUSTODO_BASE_URL
   ? [process.env.FOCUSTODO_BASE_URL.replace(/\/+$/, "")]
-  : ["https://www.focustodo.net", "https://app.hk1.focustodo.net"];
+  : ["https://app.hk1.focustodo.net", "https://www.focustodo.net"];
 let activeServer = 0;
 const CLIENT_NAME = "focustodo-mcp";
 const FETCH_TIMEOUT_MS = 30_000;
+/** 全量同步（timestamp=0）要下載約 2MB，慢的那台實測要 77 秒，30 秒不夠。 */
+const FULL_SYNC_TIMEOUT_MS = 120_000;
 const MAX_SYNC_RETRIES = 3;
 
 /** 收件匣的 magic projectId。任務沒指定清單時落在這裡，App 的收件匣看得到。
@@ -74,19 +81,32 @@ const VERIFY_TOTAL_WAIT_LABEL = "約 8 秒";
  * deadline 一路傳進每趟 fetch，等有實例再做。
  */
 
-/** fetch with AbortController timeout */
-async function fetchWithTimeout(
+/**
+ * 送一趟請求，並在 timeoutMs 內把「表頭＋整個本體」都收完。
+ *
+ * 2026-10-09 的事故：舊版只替「等表頭」設逾時，表頭到了就清掉計時器，
+ * 之後讀 2MB 本體完全沒有上限。www 下載卡住時 create_task 掛了 240 秒沒回應；
+ * 下載中途斷線時 res.json() 拋錯，被包成誤導人的「回應不是合法 JSON（HTTP 200）」。
+ */
+async function fetchText(
   url: string,
   init: RequestInit,
-  timeoutMs = FETCH_TIMEOUT_MS
-): Promise<Response> {
+  timeoutMs: number
+): Promise<{ res: Response; text: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    try {
+      return { res, text: await res.text() };
+    } catch (e) {
+      if (controller.signal.aborted) throw e;
+      const why = e instanceof Error ? e.message : String(e);
+      throw new Error(`回應下載到一半中斷（HTTP ${res.status}）：${why}`, { cause: e });
+    }
   } catch (e) {
-    if (e instanceof Error && e.name === "AbortError") {
-      throw new Error(`連線逾時（${timeoutMs / 1000} 秒）：${url}`);
+    if (controller.signal.aborted) {
+      throw new Error(`連線逾時（${timeoutMs / 1000} 秒，含下載回應）：${url}`);
     }
     throw e;
   } finally {
@@ -95,18 +115,25 @@ async function fetchWithTimeout(
 }
 
 /**
- * 對目前這台伺服器送請求；連不上（DNS／拒絕連線／逾時）就換下一台，全部失敗才 throw。
+ * 對目前這台伺服器送請求；連不上、逾時、下載中斷就換下一台，全部失敗才 throw。
  * 換台後舊 session cookie 屬於另一台，sync 會回 -1/-2，由既有的重登邏輯接手。
  * HTTP 錯誤（5xx 等）不換台：那代表伺服器活著，換台只會掩蓋問題。
+ *
+ * 寫入在下載中斷後換台重送是安全的：sync 只收完整物件、以 id 覆蓋，
+ * 同一包送兩次結果相同。
  */
-async function fetchServer(path: string, init: RequestInit): Promise<Response> {
+async function fetchServer(
+  path: string,
+  init: RequestInit,
+  timeoutMs = FETCH_TIMEOUT_MS
+): Promise<{ res: Response; text: string }> {
   let lastErr: unknown;
   for (let i = 0; i < SERVERS.length; i++) {
     const idx = (activeServer + i) % SERVERS.length;
     try {
-      const res = await fetchWithTimeout(`${SERVERS[idx]}${path}`, init);
+      const out = await fetchText(`${SERVERS[idx]}${path}`, init, timeoutMs);
       activeServer = idx;
-      return res;
+      return out;
     } catch (e) {
       lastErr = e;
     }
@@ -116,16 +143,20 @@ async function fetchServer(path: string, init: RequestInit): Promise<Response> {
   throw new Error(`所有番茄鐘伺服器都連不上（${SERVERS.join("、")}）：${msg}`);
 }
 
-/** 讀 JSON 並先檢查 HTTP 狀態。少了這層，server 回 502 HTML 時
+/** 解析 JSON 並先檢查 HTTP 狀態。少了這層，server 回 502 HTML 時
  *  錯誤訊息會是看不懂的 `Unexpected token '<'`。 */
-async function readJson<T>(res: Response, what: string): Promise<T> {
+function parseJson<T>(res: Response, text: string, what: string): T {
   if (!res.ok) {
     throw new Error(`${what} 失敗：HTTP ${res.status} ${res.statusText}`);
   }
   try {
-    return (await res.json()) as T;
+    return JSON.parse(text) as T;
   } catch {
-    throw new Error(`${what} 回應不是合法 JSON（HTTP ${res.status}）`);
+    // 開頭是 { 代表 JSON 被截斷：不印內容，登入回應裡有帳號資料
+    const sample = text.trimStart().startsWith("{")
+      ? "內容像是被截斷的 JSON"
+      : `開頭：${JSON.stringify(text.slice(0, 200))}`;
+    throw new Error(`${what} 回應不是合法 JSON（HTTP ${res.status}，${text.length} 字元，${sample}）`);
   }
 }
 
@@ -168,7 +199,7 @@ export class FocusToDoAPI {
       client: CLIENT_NAME,
     });
 
-    const res = await fetchServer("/v63/user/login", {
+    const { res, text } = await fetchServer("/v63/user/login", {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -176,7 +207,7 @@ export class FocusToDoAPI {
       body: body.toString(),
     });
 
-    const data = await readJson<LoginResponse>(res, "登入");
+    const data = parseJson<LoginResponse>(res, text, "登入");
     if (data.status !== 0) {
       throw new Error(`Login failed: status=${data.status}`);
     }
@@ -232,15 +263,19 @@ export class FocusToDoAPI {
       uid: creds.uid,
     });
 
-    const res = await fetchServer("/v64/sync", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        Cookie: creds.cookies,
+    const { res, text } = await fetchServer(
+      "/v64/sync",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          Cookie: creds.cookies,
+        },
+        body: body.toString(),
       },
-      body: body.toString(),
-    });
-    const data = await readJson<SyncResponse>(res, what);
+      opts.timestamp === 0 ? FULL_SYNC_TIMEOUT_MS : FETCH_TIMEOUT_MS
+    );
+    const data = parseJson<SyncResponse>(res, text, what);
 
     // Session cookie 輪替。放這裡而非 sync()，否則 fetchDelta 收到新 jsessionId
     // 也不會採用，下一輪驗證還在用舊 cookie。

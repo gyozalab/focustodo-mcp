@@ -109,7 +109,7 @@ node -e "console.log(require('crypto').randomUUID())"   # 產一個 token
 
 ## 技術說明
 
-- **API Base**：`https://app.hk1.focustodo.net/`
+- **API Base**：`https://app.hk1.focustodo.net/` 優先，連不上、逾時或下載中斷時自動換到 `https://www.focustodo.net/`。每趟請求的逾時涵蓋「表頭＋整個回應本體」（一般 30 秒，2MB 全量同步 120 秒）
 - **驗證方式**：Email + 密碼登入 → Cookie-based Session，過期自動重登
 - **同步機制**：`POST /v64/sync` 雙向全量同步；`timestamp` 是 epoch ms，帶入即取該時點後的 delta
   - 寫入**只收完整物件**。送 `{id, name}` 這種 partial 會被整批拒收（`status=-9`），且拒絕是原子的、不留半套狀態。所以更新一律是「讀出來 → 改欄位 → 整包送回」

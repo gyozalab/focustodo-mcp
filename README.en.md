@@ -109,7 +109,7 @@ Note that time zone follows the runtime environment (both "today" calculations a
 
 ## Technical Notes
 
-- **API Base**: `https://app.hk1.focustodo.net/`
+- **API Base**: `https://app.hk1.focustodo.net/` first, failing over to `https://www.focustodo.net/` on connection errors, timeouts, or interrupted downloads. Each request timeout covers headers *and* the full body (30s normally, 120s for the ~2MB full sync)
 - **Auth**: Email + password login → cookie-based session, re-authenticates automatically on expiry
 - **Sync**: Full bidirectional sync via `POST /v64/sync`; `timestamp` is epoch ms — pass one to receive the delta since that moment
   - Writes **only accept complete objects**. Sending a partial like `{id, name}` gets the whole batch rejected (`status=-9`), and the rejection is atomic — no half-applied state. Updates are therefore always "read → modify fields → send the whole object back"
