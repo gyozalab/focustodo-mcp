@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node --env-file-if-exists=.env dist/index.js",
     "dev": "tsx --env-file=.env src/index.ts",
-    "selftest": "tsx --env-file=.env src/selftest.ts"
+    "selftest": "tsc && tsx --env-file=.env src/selftest.ts",
+    "update": "git pull --ff-only && npm ci --no-audit --no-fund && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1"

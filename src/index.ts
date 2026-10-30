@@ -88,6 +88,18 @@ function toServerFields(i: {
   return out;
 }
 
+/**
+ * 批次寫入的工具回應。只要有一筆沒過就帶 isError：「結果未知」也算沒過，
+ * 回成功狀態的話呼叫端會以為全部都改好了。
+ */
+function batchResult(
+  verb: string,
+  r: { updated: { name: string }[]; failed: { id: string; reason: string }[] }
+) {
+  const msg = batchReport(verb, r);
+  return r.failed.length ? fail(msg) : text(msg);
+}
+
 /** 批次寫入的回報。部分成功要講清楚哪些過、哪些沒過。 */
 function batchReport(
   verb: string,
@@ -486,7 +498,7 @@ function buildServer(): McpServer {
         const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
         if (!ids.length) return fail("❌ 請提供 taskId 或 taskIds");
         const r = uncomplete ? await api.uncompleteTasks(ids) : await api.completeTasks(ids);
-        return text(batchReport(uncomplete ? "恢復未完成" : "完成", r));
+        return batchResult(uncomplete ? "恢復未完成" : "完成", r);
       } catch (error) {
         return failWith(error);
       }
@@ -504,7 +516,7 @@ function buildServer(): McpServer {
       try {
         const ids = taskIds?.length ? taskIds : taskId ? [taskId] : [];
         if (!ids.length) return fail("❌ 請提供 taskId 或 taskIds");
-        return text(batchReport("刪除", await api.deleteTasks(ids)));
+        return batchResult("刪除", await api.deleteTasks(ids));
       } catch (error) {
         return failWith(error);
       }
@@ -523,6 +535,10 @@ function buildServer(): McpServer {
     },
     async ({ taskId, minutes, endedAt, subtaskId }) => {
       try {
+        // 純日期會被 JS 當成 UTC 午夜（台灣早上 8 點），專注結束時間不能用猜的
+        if (endedAt && /^\d{4}-\d{2}-\d{2}$/.test(endedAt.trim())) {
+          return fail(`❌ endedAt 要帶時間，例如 '${endedAt.trim()}T15:30'`);
+        }
         const endDate = endedAt ? new Date(endedAt).getTime() : undefined;
         if (endedAt && Number.isNaN(endDate!)) return fail(`❌ 無法解析時間：${endedAt}`);
         const pomo = await api.logPomodoro({ taskId, minutes, endDate, subtaskId });
@@ -565,16 +581,23 @@ function buildServer(): McpServer {
 
   server.tool(
     "focustodo_create_subtask",
-    "為任務新增子任務（會自動把父任務標記為含子任務，否則 App 不顯示）",
+    "為任務新增子任務，接在既有子任務後面（會自動把父任務標記為含子任務，否則 App 不顯示）。" +
+    "要建多個時用 names 一次送出，照陣列順序排列，比逐個呼叫快很多。",
     {
       taskId: z.string().describe("父任務 ID"),
-      name: z.string().describe("子任務名稱"),
-      estimatedPomoNum: z.number().optional().describe("預估番茄數"),
+      name: z.string().optional().describe("子任務名稱（單個）"),
+      names: z.array(z.string()).optional().describe("子任務名稱陣列（多個，依序排列）"),
+      estimatedPomoNum: z.number().optional().describe("每個子任務的預估番茄數"),
     },
-    async (params) => {
+    async ({ taskId, name, names, estimatedPomoNum }) => {
       try {
-        const subtask = await api.createSubtask(params);
-        return text(`✅ 已建立子任務「${subtask.name}」\nid: ${subtask.id}`);
+        const list = [...(name ? [name] : []), ...(names ?? [])].map((n) => n.trim()).filter(Boolean);
+        if (!list.length) return fail("❌ 請提供 name 或 names（不能是空白）");
+        const made = await api.createSubtasks(taskId, list.map((n) => ({ name: n, estimatedPomoNum })));
+        return text(
+          `✅ 已建立 ${made.length} 個子任務（server 已確認）\n` +
+          made.map((s) => `- ${s.name}（id: ${s.id}）`).join("\n")
+        );
       } catch (error) {
         return failWith(error);
       }

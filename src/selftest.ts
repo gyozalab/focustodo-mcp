@@ -10,16 +10,27 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { FocusToDoAPI, parseDeadline, todayBounds, INBOX_PROJECT_ID } from "./api.js";
+import { FocusToDoAPI, parseDeadline, todayBounds, INBOX_PROJECT_ID, SyncRejectedError } from "./api.js";
 
 let failed = 0;
+/** 單項上限。寫入鎖若有人改出自己等自己，測試要顯示 ❌，不能永遠卡住。 */
+const CHECK_TIMEOUT_MS = 180_000;
+
 async function check(label: string, fn: () => void | Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
   try {
-    await fn();
+    await Promise.race([
+      Promise.resolve().then(fn),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`超過 ${CHECK_TIMEOUT_MS / 1000} 秒沒結束（卡住了？）`)), CHECK_TIMEOUT_MS);
+      }),
+    ]);
     console.log(`✅ ${label}`);
   } catch (e) {
     failed++;
     console.log(`❌ ${label}\n     ${e instanceof Error ? e.message : e}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -184,6 +195,68 @@ async function main() {
     assert.equal((await fromServer(id))!.hasSubtask, true, "父任務應標記 hasSubtask");
   });
 
+  await check("子任務：連建 3 個，order 依建立順序每次 +10000，server 確認", async () => {
+    const id = createdIds[1];
+    const made = [];
+    for (const n of [1, 2, 3]) made.push(await api.createSubtask({ taskId: id, name: `[MCP自測] 排序${n}` }));
+    await verifier.refresh();
+    const subs = await verifier.getSubtasks(id);
+    const onServer = made.map((m) => subs.find((s) => s.id === m.id));
+    assert.ok(onServer.every(Boolean), "server 上應查得到 3 個子任務");
+    assert.deepEqual(
+      onServer.map((s) => s!.order),
+      [0, 10000, 20000],
+      "空父任務上連建 3 個應為 0、10000、20000"
+    );
+  });
+
+  await check("子任務：createSubtasks 一次建 3 個，接在既有子任務後面，server 確認", async () => {
+    const id = createdIds[1]; // 上一項已建 0、10000、20000
+    const made = await api.createSubtasks(id, ["批次1", "批次2", "批次3"].map((n) => ({ name: `[MCP自測] ${n}` })));
+    await verifier.refresh();
+    const subs = await verifier.getSubtasks(id);
+    assert.deepEqual(
+      made.map((m) => subs.find((s) => s.id === m.id)?.order),
+      [30000, 40000, 50000],
+      "應接在 20000 後面依序排列"
+    );
+  });
+
+  await check("子任務：刪除後救回，server 上 state 也要回到 0", async () => {
+    const [sub] = await verifier.getSubtasks(createdIds[1]);
+    await api.updateSubtask(sub.id, { isDeleted: true });
+    await api.updateSubtask(sub.id, { isDeleted: false });
+    await verifier.refresh();
+    const raw = (verifier as unknown as { _subtasks: { id: string; state: number; isDeleted: boolean }[] })
+      ._subtasks.find((s) => s.id === sub.id);
+    assert.equal(raw?.isDeleted, false);
+    assert.equal(raw?.state, 0, "isDeleted=false 但 state 留在 -1，App 可能仍不顯示");
+  });
+
+  await check("子任務：刪掉最後一個、新建一個、再救回舊的，order 不能撞號", async () => {
+    const id = createdIds[1];
+    await verifier.refresh();
+    const subs = await verifier.getSubtasks(id);
+    const last = subs.reduce((a, b) => (b.order > a.order ? b : a));
+    await api.updateSubtask(last.id, { isDeleted: true });
+    const [fresh] = await api.createSubtasks(id, [{ name: "[MCP自測] 頂替" }]);
+    assert.equal(fresh.order, last.order, "前提：新建的拿到被刪那個的 order");
+    await api.updateSubtask(last.id, { isDeleted: false });
+    await verifier.refresh();
+    const orders = (await verifier.getSubtasks(id)).map((s) => s.order);
+    assert.equal(new Set(orders).size, orders.length, `order 有重複：${orders.join(",")}`);
+  });
+
+  await check("同時補記 2 次番茄鐘到同一任務，計數要 +2（不能互相蓋掉）", async () => {
+    const id = createdIds[1];
+    const before = (await fromServer(id))!.actualPomoNum;
+    await Promise.all([
+      api.logPomodoro({ taskId: id, minutes: 1 }),
+      api.logPomodoro({ taskId: id, minutes: 1 }),
+    ]);
+    assert.equal((await fromServer(id))!.actualPomoNum, before + 2);
+  });
+
   await check("批次完成 3 個 → 再批次取消完成，server 確認", async () => {
     const done = await api.completeTasks(createdIds);
     assert.equal(done.failed.length, 0, `不該有失敗：${JSON.stringify(done.failed)}`);
@@ -328,6 +401,68 @@ async function main() {
     assert.equal((await probe.fetchDelta(Date.now(), false)).tasks.length, 1);
   });
 
+  await check("清單名稱部分相符多個要報錯；完全相符優先", async () => {
+    const probe = new FocusToDoAPI(account, password) as unknown as {
+      _projects: unknown[];
+      findProject: (name: string) => { name: string } | undefined;
+    };
+    const mk = (id: string, name: string) => ({
+      id, name, type: 1000, order: 0, color: "", isDefault: false, isDeleted: false, state: 0, parentId: "", creationDate: 0,
+    });
+    probe._projects = [mk("a", "工作A"), mk("b", "工作B"), mk("c", "工作")];
+    assert.equal(probe.findProject("工作")?.name, "工作", "完全相符應優先");
+    assert.throws(() => probe.findProject("作"), /同時符合/, "部分相符命中多個不能取第一個");
+    assert.equal(probe.findProject("作B")?.name, "工作B", "只命中一個時照常回傳");
+  });
+
+  await check("寫入送出後網路出錯要回「結果未知」；server 明確拒收則照原錯誤", async () => {
+    const probe = new FocusToDoAPI(account, password) as unknown as {
+      ensureAuth: () => Promise<unknown>;
+      postSync: () => Promise<unknown>;
+      push: (p: unknown) => Promise<void>;
+      sync: (p?: unknown) => Promise<unknown>;
+    };
+    probe.ensureAuth = async () => ({});
+    probe.postSync = async () => {
+      throw new Error("所有番茄鐘伺服器都連不上（x）：連線逾時");
+    };
+    await assert.rejects(probe.push({}), /寫入結果未知.*不要直接重送/);
+    // -9 的錯誤由正式的 syncRaw 產生，不在測試裡寫死訊息：改字時這項才抓得到
+    probe.postSync = async () => ({ status: -9, timestamp: 0 });
+    await assert.rejects(probe.push({}), (e: Error) => e instanceof SyncRejectedError && !/結果未知/.test(e.message));
+    // 對外的 sync() 帶資料要被擋下，否則會繞過寫入鎖
+    await assert.rejects(probe.sync({ tasks: [] }), /只能拉取/);
+  });
+
+  await check("驗證讀回失敗不往上拋：下一輪看到就算成功，全失敗回「結果未知」", async () => {
+    const probe = new FocusToDoAPI(account, password) as unknown as {
+      fetchDelta: () => Promise<unknown>;
+      verifyApplied: (k: string, e: { id: string; fields: Record<string, unknown> }[], t: number) => Promise<{ reason: string }[]>;
+    };
+    const emptyish = { status: 0, timestamp: 0, projects: [], subtasks: [], pomodoros: [] };
+    let calls = 0;
+    probe.fetchDelta = async () => {
+      if (calls++ === 0) throw new Error("連線逾時");
+      return { ...emptyish, tasks: [{ id: "x", name: "n" }] };
+    };
+    assert.deepEqual(await probe.verifyApplied("tasks", [{ id: "x", fields: { name: "n" } }], Date.now()), []);
+
+    probe.fetchDelta = async () => {
+      throw new Error("連線逾時");
+    };
+    const [r] = await probe.verifyApplied("tasks", [{ id: "x", fields: { name: "n" } }], Date.now());
+    assert.match(r.reason, /結果未知/);
+
+    // 第一輪讀到寫入前的舊值、之後讀回都失敗：不能拿第一輪的「不符」定讞
+    calls = 0;
+    probe.fetchDelta = async () => {
+      if (calls++ === 0) return { ...emptyish, tasks: [{ id: "x", name: "舊值" }] };
+      throw new Error("連線逾時");
+    };
+    const [r2] = await probe.verifyApplied("tasks", [{ id: "x", fields: { name: "n" } }], Date.now());
+    assert.match(r2.reason, /結果未知/, `不該說成 server 存的值不符：${r2.reason}`);
+  });
+
   await checkHttpMode();
 
   // 保險：中途失敗的測試會留下 [MCP自測] 資料，收尾統一掃一次
@@ -386,12 +521,17 @@ async function checkHttpMode(): Promise<void> {
     return;
   }
 
-  const PORT = 8799;
+  // 隨機埠：上一輪被中斷留下的孤兒 process 佔著固定埠時，新的綁不上就默默死掉
+  const PORT = 20000 + Math.floor(Math.random() * 20000);
   const TOKEN = "selftest-token";
   const child = spawn(process.execPath, ["dist/index.js"], {
     env: { ...process.env, PORT: String(PORT), MCP_AUTH_TOKEN: TOKEN },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
   });
+  let stderr = "";
+  child.stderr!.on("data", (d) => (stderr += d));
+  let exitCode: number | null | undefined;
+  child.on("exit", (code) => (exitCode = code));
 
   const post = async (body: unknown, token = TOKEN) => {
     const res = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
@@ -407,15 +547,27 @@ async function checkHttpMode(): Promise<void> {
   };
 
   try {
-    // 等 server 起來
-    for (let i = 0; i < 30; i++) {
+    // 等 server 起來。舊版只等 6 秒、等不到也照跑，Windows 冷啟動載入 SDK 稍慢
+    // 後面三項就一起 fetch failed，看起來像偶發。等不到要明說，並附上子程序的錯誤。
+    let ready = false;
+    for (let i = 0; i < 150 && exitCode === undefined; i++) {
       try {
-        if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) break;
+        if ((await fetch(`http://127.0.0.1:${PORT}/health`)).ok) {
+          ready = true;
+          break;
+        }
       } catch {
         /* 還沒起來 */
       }
       await new Promise((r) => setTimeout(r, 200));
     }
+    await check("HTTP server 30 秒內起得來", () => {
+      assert.ok(
+        ready,
+        `server 沒起來（exit=${exitCode === undefined ? "仍在跑" : exitCode}）stderr 末段：${stderr.slice(-300)}`
+      );
+    });
+    if (!ready) return;
 
     await check("/mcp 需要 Bearer token，錯的要 401", async () => {
       assert.equal((await post({ jsonrpc: "2.0", id: 1, method: "initialize" }, "wrong")).status, 401);

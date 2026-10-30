@@ -81,6 +81,12 @@ const VERIFY_TOTAL_WAIT_LABEL = "約 8 秒";
  * deadline 一路傳進每趟 fetch，等有實例再做。
  */
 
+/** 寫入排隊最多等多久。超過就放棄並說「可以重試」，留時間給自己那趟寫入在 60 秒內跑完。 */
+const WRITE_QUEUE_MAX_WAIT_MS = 20_000;
+
+/** server 明確回了非 0 狀態：寫入沒有生效。用類別判斷，不靠比對錯誤訊息的字串。 */
+export class SyncRejectedError extends Error {}
+
 /**
  * 送一趟請求，並在 timeoutMs 內把「表頭＋整個本體」都收完。
  *
@@ -152,11 +158,16 @@ function parseJson<T>(res: Response, text: string, what: string): T {
   try {
     return JSON.parse(text) as T;
   } catch {
-    // 開頭是 { 代表 JSON 被截斷：不印內容，登入回應裡有帳號資料
-    const sample = text.trimStart().startsWith("{")
-      ? "內容像是被截斷的 JSON"
-      : `開頭：${JSON.stringify(text.slice(0, 200))}`;
-    throw new Error(`${what} 回應不是合法 JSON（HTTP ${res.status}，${text.length} 字元，${sample}）`);
+    // 不放回應原文：錯誤訊息會一路回到 MCP client，而回應裡可能有帳號資料
+    // （登入回應、或中間代理塞進來的頁面）。只留判斷得出問題類型的資訊。
+    const head = text.trimStart();
+    const kind = head.startsWith("{")
+      ? "像是被截斷的 JSON"
+      : head.startsWith("<")
+      ? "像是 HTML 頁面（可能是代理或維護頁）"
+      : "不明格式";
+    const type = res.headers.get("content-type") || "未標示";
+    throw new Error(`${what} 回應不是合法 JSON（HTTP ${res.status}，${text.length} 字元，${type}，${kind}）`);
   }
 }
 
@@ -179,6 +190,15 @@ export class FocusToDoAPI {
   private syncTimestamp = 0;
   private lastFetchedAt = 0;
   private inFlightSync: Promise<SyncResponse> | null = null;
+  /**
+   * 寫入一律排隊。寫入是「讀快取 → 改欄位 → 整包送回」，兩個寫入同時跑會拿到
+   * 同一份底稿，後送的那包把先送的欄位寫回舊值（例如兩次補記番茄鐘只加 1 顆）。
+   * LLM 平行呼叫工具、HTTP 模式下多個 client 共用實例，都會撞上。
+   *
+   * ⚠️ 只管同一個 process。Hermes 的橋接腳本每次開新 process，和這個 MCP server
+   * 之間的競態仍在；要消除得靠跨 process 的鎖，或讓 Hermes 改走 HTTP MCP。
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve();
 
   // Cached data from last sync
   private _projects: Project[] = [];
@@ -287,8 +307,21 @@ export class FocusToDoAPI {
     return data;
   }
 
-  /** 完整同步（拉取+推送）*/
-  async sync(
+  /**
+   * 向 server 拉取變動（只讀）。寫入請用 createTasks／updateTasks 等方法：它們會排隊、
+   * 先刷新底稿、送出後驗證；直接帶 payload 呼叫會繞過這些，和其他寫入互相蓋掉。
+   */
+  sync(payload?: never): Promise<SyncResponse> {
+    if (payload !== undefined) {
+      return Promise.reject(
+        new Error("sync() 只能拉取，不能帶資料寫入。請改用 createTasks／updateTasks／createSubtasks 等寫入方法。")
+      );
+    }
+    return this.syncRaw();
+  }
+
+  /** 完整同步（拉取+推送）。只給內部用：寫入一律經 push()，它在寫入鎖裡呼叫這裡。 */
+  private async syncRaw(
     payload?: {
       projects?: Partial<Project>[];
       tasks?: Partial<Task>[];
@@ -308,11 +341,11 @@ export class FocusToDoAPI {
         this.creds = null;
         const backoffMs = Math.min(1000 * 2 ** _retryCount, 8000) + Math.random() * 500;
         await new Promise((r) => setTimeout(r, backoffMs));
-        return this.sync(payload, _retryCount + 1);
+        return this.syncRaw(payload, _retryCount + 1);
       }
       // status 語義（實測）：-1/-2=session 失效（上面已重試）、-9=送出的資料被拒收
       const hint = data.status === -9 ? "（-9：資料格式被 server 拒收，例如送了不完整的物件）" : "";
-      throw new Error(`Sync failed: status=${data.status}${hint} (after ${_retryCount} retries)`);
+      throw new SyncRejectedError(`Sync failed: status=${data.status}${hint} (after ${_retryCount} retries)`);
     }
 
     // Merge data into cache
@@ -389,7 +422,53 @@ export class FocusToDoAPI {
    * 從 60 秒縮到一次往返，消不掉。真要消除得靠 server 端的樂觀鎖，而它沒有。
    */
   private async freshData(): Promise<void> {
+    // 進行中的同步可能是這次呼叫之前很久就發出的（冷啟動的全量同步要跑上百秒），
+    // 直接共用它會拿到不含這段期間 App 修改的底稿。等它結束，再發一次新的。
+    if (this.inFlightSync) await this.inFlightSync.catch(() => {});
     await this.refresh();
+  }
+
+  /**
+   * 排隊執行寫入。內部的 *Unlocked 方法彼此可以互相呼叫，對外入口才經過這裡。
+   *
+   * 排太久就放棄：MCP client 等不到回應會自己報逾時，LLM 接著重試；這筆要是輪到了
+   * 照樣送出，就多出一筆重複的。輪到時還沒送，所以可以明說「能安全重試」。
+   */
+  private withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+    const queuedAt = Date.now();
+    const start = () => {
+      const waited = Date.now() - queuedAt;
+      if (waited > WRITE_QUEUE_MAX_WAIT_MS) {
+        return Promise.reject(
+          new Error(`前面的寫入還沒做完，這筆排隊 ${Math.round(waited / 1000)} 秒仍未送出，可以安全重試。`)
+        );
+      }
+      return fn();
+    };
+    const run = this.writeQueue.then(start, start);
+    this.writeQueue = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * 寫入專用的 sync。送出之後才出的錯（逾時、換台、下載中斷）代表結果未知：
+   * 第一台可能已經寫進去了。照一般錯誤回報，LLM 會重試，而每次重試都帶新的
+   * randomUUID，於是多出一張重複任務或一筆重複番茄鐘。所以這類錯誤要明說「先查再說」。
+   */
+  private async push(payload: Parameters<FocusToDoAPI["syncRaw"]>[0]): Promise<void> {
+    await this.ensureAuth(); // 登入失敗代表根本還沒送出，原樣往上拋
+    try {
+      await this.syncRaw(payload);
+    } catch (e) {
+      // server 明確回了非 0 狀態（-9 拒收、重登後仍失效），代表沒有寫進去
+      if (e instanceof SyncRejectedError) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.lastFetchedAt = 0;
+      throw new Error(
+        `寫入結果未知：${msg}。請求可能已經送到 server，請先查詢確認，不要直接重送。`,
+        { cause: e }
+      );
+    }
   }
 
   /** projectId → 顯示名稱。收件匣不是真 project，server 的 projects 裡查不到。 */
@@ -410,10 +489,17 @@ export class FocusToDoAPI {
       };
     }
     const alive = this._projects.filter((p) => !p.isDeleted && isRealProject(p));
-    return (
-      alive.find((p) => p.name.toLowerCase() === lc) ||
-      alive.find((p) => p.name.toLowerCase().includes(lc))
-    );
+    const exact = alive.find((p) => p.name.toLowerCase() === lc);
+    if (exact) return exact;
+    // 部分相符只命中一個才算數。「工作」同時符合「工作A」「工作B」時取第一個，
+    // 任務會靜默落進哪個清單取決於陣列順序。
+    const partial = alive.filter((p) => p.name.toLowerCase().includes(lc));
+    if (partial.length > 1) {
+      throw new Error(
+        `「${name}」同時符合 ${partial.map((p) => (p.type === TYPE_TAG ? `#${p.name}` : p.name)).join("、")}，請給完整名稱`
+      );
+    }
+    return partial[0];
   }
 
   /** 同 findProject，但找不到就 throw 並列出可選項 */
@@ -437,17 +523,19 @@ export class FocusToDoAPI {
     const unknown: string[] = [];
     for (const part of parts) {
       // 只認標籤的 ID。傳一般清單的 ID 會寫進去一個 App 解讀不了的 tags 值
-      const byId = this._projects.find((p) => p.id === part && p.type === TYPE_TAG);
+      const liveTags = this._projects.filter((p) => p.type === TYPE_TAG && !p.isDeleted);
+      const byId = liveTags.find((p) => p.id === part);
       if (byId) {
         ids.push(byId.id);
         continue;
       }
-      const tag = this._projects.find(
-        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase() === part.toLowerCase()
-      ) || this._projects.find(
-        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase().includes(part.toLowerCase())
-      );
-      if (tag) ids.push(tag.id);
+      const lc = part.toLowerCase();
+      const exact = liveTags.find((p) => p.name.toLowerCase() === lc);
+      const partial = exact ? [exact] : liveTags.filter((p) => p.name.toLowerCase().includes(lc));
+      if (partial.length > 1) {
+        throw new Error(`標籤「${part}」同時符合 ${partial.map((p) => `#${p.name}`).join("、")}，請給完整名稱`);
+      }
+      if (partial.length) ids.push(partial[0].id);
       else unknown.push(part);
     }
     if (unknown.length) {
@@ -503,11 +591,13 @@ export class FocusToDoAPI {
     }
     if (filters?.tag) {
       const wanted = filters.tag.toLowerCase().replace(/^#/, "");
-      const tagProject = this._projects.find(
-        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase() === wanted
-      ) || this._projects.find(
-        (p) => p.type === TYPE_TAG && !p.isDeleted && p.name.toLowerCase().includes(wanted)
-      );
+      const liveTags = this._projects.filter((p) => p.type === TYPE_TAG && !p.isDeleted);
+      const exact = liveTags.find((p) => p.name.toLowerCase() === wanted);
+      const partial = exact ? [exact] : liveTags.filter((p) => p.name.toLowerCase().includes(wanted));
+      if (partial.length > 1) {
+        throw new Error(`標籤「${filters.tag}」同時符合 ${partial.map((p) => `#${p.name}`).join("、")}，請給完整名稱`);
+      }
+      const tagProject = partial[0];
       if (!tagProject) {
         const available = this._projects.filter((p) => p.type === TYPE_TAG && !p.isDeleted).map((p) => p.name);
         throw new Error(`找不到標籤「${filters.tag}」。現有標籤：${available.join("、") || "（無）"}`);
@@ -539,7 +629,7 @@ export class FocusToDoAPI {
           .split(",")
           .filter(Boolean)
           .map((id) => {
-            const proj = this._projects.find((p) => p.id === id.trim());
+            const proj = this._projects.find((p) => p.id === id.trim() && !p.isDeleted);
             return proj ? `#${proj.name}` : "";
           })
           .filter(Boolean)
@@ -552,6 +642,16 @@ export class FocusToDoAPI {
   private nextTaskOrder(): number {
     // reduce 而非 Math.min(...spread)：任務數上萬時 spread 會爆 argument 上限
     return this._tasks.reduce((min, t) => Math.min(min, t.order), 0) - 10000;
+  }
+
+  /**
+   * 子任務接在同一父任務的最後面，跟 App 一致：第一個給 0，之後取未刪除子任務的最大值 + 10000。
+   * 舊版寫死 10000，連建多個會全擠在同一個 order，App 裡順序亂跳。
+   */
+  private nextSubtaskOrder(taskId: string): number {
+    const siblings = this._subtasks.filter((s) => s.taskId === taskId && !s.isDeleted);
+    if (!siblings.length) return 0;
+    return siblings.reduce((max, s) => Math.max(max, s.order), -Infinity) + 10000;
   }
 
   async getTaskById(taskId: string): Promise<EnrichedTask | undefined> {
@@ -574,7 +674,11 @@ export class FocusToDoAPI {
   // ===== 寫入 API =====
 
   /** 建立多個任務。回傳建立結果，projectName 找不到時整批不送出。 */
-  async createTasks(
+  createTasks(items: Parameters<FocusToDoAPI["createTasksUnlocked"]>[0]): Promise<Task[]> {
+    return this.withWriteLock(() => this.createTasksUnlocked(items));
+  }
+
+  private async createTasksUnlocked(
     items: {
       name: string;
       projectName?: string;
@@ -631,7 +735,7 @@ export class FocusToDoAPI {
     });
 
     const pushedAt = Date.now();
-    await this.sync({ tasks: built });
+    await this.push({ tasks: built });
     for (const task of built) this.mergeArray(this._tasks, [task]);
 
     const rejected = await this.verifyApplied(
@@ -672,7 +776,14 @@ export class FocusToDoAPI {
    * 不要退回「逐筆呼叫 updateTask」——每筆內含 1.5 秒等待加兩趟 HTTP，
    * 20 筆就會撞上 MCP 的逾時上限。
    */
-  async updateTasks(
+  updateTasks(
+    taskIds: string[],
+    updates: TaskPatch | ((task: Task) => TaskPatch)
+  ): Promise<{ updated: Task[]; failed: { id: string; reason: string }[] }> {
+    return this.withWriteLock(() => this.updateTasksUnlocked(taskIds, updates));
+  }
+
+  private async updateTasksUnlocked(
     taskIds: string[],
     updates: TaskPatch | ((task: Task) => TaskPatch)
   ): Promise<{ updated: Task[]; failed: { id: string; reason: string }[] }> {
@@ -701,7 +812,7 @@ export class FocusToDoAPI {
 
     const pushed = staged.map(({ task, patch }) => ({ ...task, ...patch }) as Task);
     const pushedAt = Date.now();
-    await this.sync({ tasks: pushed });
+    await this.push({ tasks: pushed });
     for (const t of pushed) this.mergeArray(this._tasks, [t]);
 
     // Server 曾對既有任務的修改 silently reject（回 status=0 卻不持久化）。
@@ -798,11 +909,22 @@ export class FocusToDoAPI {
 
     let pending = expectations;
     const mismatched = new Map<string, string>();
+    let readError = "";
 
     for (let attempt = 0; attempt < VERIFY_ATTEMPTS && pending.length; attempt++) {
       await new Promise((r) => setTimeout(r, VERIFY_BASE_DELAY_MS * 3 ** attempt));
 
-      const data = await this.fetchDelta(pushedAt - 5000);
+      // 寫入已經送出了，讀回失敗只代表「這輪沒看到」。直接往上拋的話，
+      // 呼叫端拿到的是一般錯誤，LLM 會重送出一筆重複的。
+      let data: SyncResponse;
+      try {
+        data = await this.fetchDelta(pushedAt - 5000);
+        readError = "";
+      } catch (e) {
+        readError = e instanceof Error ? e.message : String(e);
+        mismatched.clear(); // 只有最後一輪算數：這輪沒讀到，前一輪的「不符」就不能拿來定讞
+        continue;
+      }
       const rows = (data[kind] || []) as { id: string }[];
       const stillPending: typeof pending = [];
       // 只有最後一輪的比對結果算數：前幾輪的不符很可能是還沒寫完的舊值
@@ -835,6 +957,8 @@ export class FocusToDoAPI {
         id: p.id,
         reason: reason
           ? `Server 存的值與送出的不符（重試 ${VERIFY_ATTEMPTS} 次後仍不符）：${reason}`
+          : readError
+          ? `寫入已送出，但讀回確認失敗（${readError}）。結果未知，請先查詢確認，不要重複送出。`
           : `無法確認 server 是否已套用（等待 ${VERIFY_TOTAL_WAIT_LABEL} 仍未在同步資料中出現）。` +
             `這通常是 server 寫入延遲，不代表被拒絕——變更很可能稍後就會生效。` +
             `請重新查詢確認，不要重複送出。`,
@@ -860,37 +984,79 @@ export class FocusToDoAPI {
     name: string;
     estimatedPomoNum?: number;
   }): Promise<Subtask> {
-    await this.freshData(); // 會連帶推送父任務的 hasSubtask，整物件覆蓋
-
-    const now = Date.now();
-    const subtask: Subtask = {
-      id: randomUUID(),
-      name: params.name,
-      taskId: params.taskId,
-      order: 10000,
-      isFinished: false,
-      isDeleted: false,
-      finishedDate: 0,
-      creationDate: now,
-      estimatedPomoNum: params.estimatedPomoNum ?? 0,
-      state: STATE_ACTIVE,
-    };
-
-    // 父任務要標記 hasSubtask，否則 App 不展開子任務區塊
-    const parent = this._tasks.find((t) => t.id === params.taskId);
-    if (!parent) throw new Error(`找不到父任務 ${params.taskId}`);
-    const parentPatch = !parent.hasSubtask ? [{ ...parent, hasSubtask: true }] : [];
-
-    const pushedAt = Date.now();
-    await this.sync({ subtasks: [subtask], tasks: parentPatch });
-    this.mergeArray(this._subtasks, [subtask]);
-    if (parentPatch.length) this.mergeArray(this._tasks, parentPatch);
-
-    await this.verifyOneOrThrow("subtasks", subtask.id, { name: subtask.name }, pushedAt);
+    const [subtask] = await this.createSubtasks(params.taskId, [params]);
     return subtask;
   }
 
-  async updateSubtask(
+  /**
+   * 一次建多個子任務：一次 sync 送出、一次 delta 驗證。
+   * 逐個呼叫 createSubtask 每個都要「刷新 → 寫入 → 驗證」三趟以上，20 個就是 60 趟。
+   */
+  createSubtasks(
+    taskId: string,
+    items: { name: string; estimatedPomoNum?: number }[]
+  ): Promise<Subtask[]> {
+    return this.withWriteLock(() => this.createSubtasksUnlocked(taskId, items));
+  }
+
+  private async createSubtasksUnlocked(
+    taskId: string,
+    items: { name: string; estimatedPomoNum?: number }[]
+  ): Promise<Subtask[]> {
+    if (!items.length) return [];
+    await this.freshData(); // 會連帶推送父任務的 hasSubtask，整物件覆蓋
+
+    // 父任務要標記 hasSubtask，否則 App 不展開子任務區塊
+    const parent = this._tasks.find((t) => t.id === taskId);
+    if (!parent) throw new Error(`找不到父任務 ${taskId}`);
+    const parentPatch = !parent.hasSubtask ? [{ ...parent, hasSubtask: true }] : [];
+
+    const now = Date.now();
+    let order = this.nextSubtaskOrder(taskId);
+    const built: Subtask[] = items.map((item) => {
+      const subtask: Subtask = {
+        id: randomUUID(),
+        name: item.name,
+        taskId,
+        order,
+        isFinished: false,
+        isDeleted: false,
+        finishedDate: 0,
+        creationDate: now,
+        estimatedPomoNum: item.estimatedPomoNum ?? 0,
+        state: STATE_ACTIVE,
+      };
+      order += 10000;
+      return subtask;
+    });
+
+    const pushedAt = Date.now();
+    await this.push({ subtasks: built, tasks: parentPatch });
+    this.mergeArray(this._subtasks, built);
+    if (parentPatch.length) this.mergeArray(this._tasks, parentPatch);
+
+    const rejected = await this.verifyApplied(
+      "subtasks",
+      built.map((s) => ({ id: s.id, fields: { name: s.name, order: s.order } })),
+      pushedAt
+    );
+    if (rejected.length) {
+      this.lastFetchedAt = 0;
+      throw new Error(
+        `${rejected.length}/${built.length} 個子任務無法確認：` + rejected.map((r) => r.reason).join("; ")
+      );
+    }
+    return built;
+  }
+
+  updateSubtask(
+    subtaskId: string,
+    updates: Partial<Pick<Subtask, "name" | "isFinished" | "isDeleted" | "estimatedPomoNum">>
+  ): Promise<Subtask | null> {
+    return this.withWriteLock(() => this.updateSubtaskUnlocked(subtaskId, updates));
+  }
+
+  private async updateSubtaskUnlocked(
     subtaskId: string,
     updates: Partial<Pick<Subtask, "name" | "isFinished" | "isDeleted" | "estimatedPomoNum">>
   ): Promise<Subtask | null> {
@@ -902,11 +1068,19 @@ export class FocusToDoAPI {
     if (updates.isFinished !== undefined) {
       patch.finishedDate = updates.isFinished ? Date.now() : 0;
     }
-    if (updates.isDeleted) patch.state = STATE_DELETED;
+    // 取消刪除也要把 state 改回來，否則 isDeleted=false 但 state 還是 -1
+    if (updates.isDeleted !== undefined) patch.state = updates.isDeleted ? STATE_DELETED : STATE_ACTIVE;
+    // 救回時舊的 order 可能已被刪除後新建的子任務拿走（排序只看未刪除的），撞號就接到最後
+    if (sub.isDeleted && updates.isDeleted === false) {
+      const clash = this._subtasks.some(
+        (s) => s.taskId === sub.taskId && s.id !== sub.id && !s.isDeleted && s.order === sub.order
+      );
+      if (clash) patch.order = this.nextSubtaskOrder(sub.taskId);
+    }
 
     const updated = { ...sub, ...patch };
     const pushedAt = Date.now();
-    await this.sync({ subtasks: [updated] });
+    await this.push({ subtasks: [updated] });
     this.mergeArray(this._subtasks, [updated]);
 
     await this.verifyOneOrThrow("subtasks", subtaskId, patch as Record<string, unknown>, pushedAt);
@@ -920,7 +1094,16 @@ export class FocusToDoAPI {
    * 番茄鐘是結束後才寫入一筆記錄，所以這裡記的是「已經完成的專注」。
    * 同時累加父任務的 actualPomoNum，否則 App 上任務的番茄計數不會動。
    */
-  async logPomodoro(params: {
+  logPomodoro(params: {
+    taskId: string;
+    minutes: number;
+    endDate?: number;
+    subtaskId?: string;
+  }): Promise<Pomodoro> {
+    return this.withWriteLock(() => this.logPomodoroUnlocked(params));
+  }
+
+  private async logPomodoroUnlocked(params: {
     taskId: string;
     minutes: number;
     endDate?: number;
@@ -954,7 +1137,7 @@ export class FocusToDoAPI {
     const taskPatch = { ...task, actualPomoNum: task.actualPomoNum + 1 };
 
     const pushedAt = Date.now();
-    await this.sync({ pomodoros: [pomo], tasks: [taskPatch] });
+    await this.push({ pomodoros: [pomo], tasks: [taskPatch] });
     this.mergeArray(this._pomodoros, [pomo]);
     this.mergeArray(this._tasks, [taskPatch]);
 
@@ -968,7 +1151,13 @@ export class FocusToDoAPI {
    * ⚠️ 刪任務不會連帶刪它的番茄鐘——那些記錄會繼續留在統計裡，
    * 「今日專注」還會顯示已刪任務的名稱。要真正移除得走這裡。
    */
-  async deletePomodoros(pomodoroIds: string[]): Promise<{ deleted: number; focusSeconds: number }> {
+  deletePomodoros(pomodoroIds: string[]): Promise<{ deleted: number; focusSeconds: number }> {
+    return this.withWriteLock(() => this.deletePomodorosUnlocked(pomodoroIds));
+  }
+
+  private async deletePomodorosUnlocked(
+    pomodoroIds: string[]
+  ): Promise<{ deleted: number; focusSeconds: number }> {
     await this.freshData();
 
     const targets = this._pomodoros.filter(
@@ -987,7 +1176,7 @@ export class FocusToDoAPI {
 
     const removed = targets.map((p) => ({ ...p, state: STATE_DELETED }));
     const pushedAt = Date.now();
-    await this.sync({ pomodoros: removed, tasks: taskPatches });
+    await this.push({ pomodoros: removed, tasks: taskPatches });
     this.mergeArray(this._pomodoros, removed);
     if (taskPatches.length) this.mergeArray(this._tasks, taskPatches);
 
@@ -1012,14 +1201,20 @@ export class FocusToDoAPI {
 
   // ===== 清單 =====
 
-  async createProject(params: {
+  createProject(params: { name: string; color?: string; isTag?: boolean }): Promise<Project> {
+    return this.withWriteLock(() => this.createProjectUnlocked(params));
+  }
+
+  private async createProjectUnlocked(params: {
     name: string;
     color?: string;
     isTag?: boolean;
   }): Promise<Project> {
     await this.ensureData();
 
-    if (this.findProject(params.name)?.name.toLowerCase() === params.name.toLowerCase()) {
+    // 只擋完全同名。走 findProject 的話，部分相符多個時會被當成「名稱有歧義」擋下
+    const lc = params.name.toLowerCase().replace(/^#/, "");
+    if (this._projects.some((p) => !p.isDeleted && isRealProject(p) && p.name.toLowerCase() === lc)) {
       throw new Error(`清單「${params.name}」已存在`);
     }
 
@@ -1038,7 +1233,7 @@ export class FocusToDoAPI {
     };
 
     const pushedAt = Date.now();
-    await this.sync({ projects: [project] });
+    await this.push({ projects: [project] });
     this.mergeArray(this._projects, [project]);
 
     await this.verifyOneOrThrow("projects", project.id, { name: project.name }, pushedAt);
@@ -1046,7 +1241,11 @@ export class FocusToDoAPI {
   }
 
   /** 清單改名／改色。收件匣是 magic 不是真 project，改不了。 */
-  async updateProject(
+  updateProject(nameOrId: string, updates: { name?: string; color?: string }): Promise<Project> {
+    return this.withWriteLock(() => this.updateProjectUnlocked(nameOrId, updates));
+  }
+
+  private async updateProjectUnlocked(
     nameOrId: string,
     updates: { name?: string; color?: string }
   ): Promise<Project> {
@@ -1070,7 +1269,7 @@ export class FocusToDoAPI {
     const clean = Object.fromEntries(Object.entries(updates).filter(([, v]) => v !== undefined));
     const updated: Project = { ...target, ...clean };
     const pushedAt = Date.now();
-    await this.sync({ projects: [updated] });
+    await this.push({ projects: [updated] });
     this.mergeArray(this._projects, [updated]);
 
     await this.verifyOneOrThrow("projects", updated.id, { name: updated.name }, pushedAt);
@@ -1084,7 +1283,14 @@ export class FocusToDoAPI {
    * 一個已刪除的清單，在 App 任何視圖都看不到，也救不回來。所以這裡不允許
    * 靜默留下孤兒：清單裡還有活著的任務時，呼叫端一定要指定去處。
    */
-  async deleteProject(
+  deleteProject(
+    nameOrId: string,
+    opts?: { moveTasksTo?: string }
+  ): Promise<{ project: Project; movedTasks: number; movedTo?: string }> {
+    return this.withWriteLock(() => this.deleteProjectUnlocked(nameOrId, opts));
+  }
+
+  private async deleteProjectUnlocked(
     nameOrId: string,
     opts?: { moveTasksTo?: string }
   ): Promise<{ project: Project; movedTasks: number; movedTo?: string }> {
@@ -1113,7 +1319,8 @@ export class FocusToDoAPI {
       if (movedTo.id === target.id) throw new Error("不能把任務搬到正在刪除的清單");
       if (movedTo.type === TYPE_TAG) throw new Error(`「${movedTo.name}」是標籤不是清單，不能當任務的去處`);
 
-      const moved = await this.updateTasks(
+      // 已經在寫入鎖裡，呼叫對外的 updateTasks 會排在自己後面，永遠等不到
+      const moved = await this.updateTasksUnlocked(
         inside.map((t) => t.id),
         { projectId: movedTo.id }
       );
@@ -1127,7 +1334,7 @@ export class FocusToDoAPI {
 
     const deleted: Project = { ...target, isDeleted: true, state: STATE_DELETED };
     const pushedAt = Date.now();
-    await this.sync({ projects: [deleted] });
+    await this.push({ projects: [deleted] });
     this.mergeArray(this._projects, [deleted]);
 
     await this.verifyOneOrThrow("projects", deleted.id, { isDeleted: true }, pushedAt);
